@@ -69,26 +69,3 @@ are single-use. Set a custom endpoint only for a token service you trust: it
 receives the OIDC credential.
 Requests refuse redirects. Proxies and custom CA settings must be configured for
 Node's native fetch on self-hosted runners.
-
-## Development and release
-
-Run `npm run check` and `npm test` with Node.js 24 or newer. Tests mock the
-identity provider and token service; a real trusted-publishing exchange requires
-a GitHub Actions run with a matching NuGet.org policy.
-
-Commit the source files; consumers do not need to install dependencies or build.
-The CI workflow tests on Linux, Windows, and macOS. Run
-[**Release action**](https://github.com/soenneker/nuget-resilient-login/actions/workflows/release.yml)
-from `main` with a new version such as `1.0.1` (a `v` prefix is also accepted).
-It validates the version, tests on all three platforms, tags the tested commit,
-and publishes a GitHub release with generated release notes. Existing tags are
-never moved. A failed release attempt can be rerun against the same commit.
-Select `draft` to prepare a draft instead, or `dry-run` to test without creating
-a tag or release. No additional secrets are required.
-
-The workflow summary links to the release editor. Select
-**Publish this Action to the GitHub Marketplace**, choose categories, and save.
-The repository must be public, the action name unique, and the repository owner
-must accept the Marketplace Developer Agreement. GitHub's documented Releases
-API does not expose Marketplace publication, so that final UI step remains
-necessary; publishing a GitHub release alone does not confirm Marketplace listing.
