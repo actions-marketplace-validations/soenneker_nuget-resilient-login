@@ -1,0 +1,22 @@
+name: "NuGet Resilient Login"
+description: "Authenticate to NuGet.org with GitHub OIDC, bounded retries, request timeouts, and masked credentials."
+author: 'soenneker'
+branding:
+  icon: "key"
+  color: "blue"
+inputs:
+  user:
+    description: NuGet.org username of the trusted publishing policy creator.
+    required: true
+  max-retries:
+    description: Retries per request for transient network failures, throttling, and server errors (0-5).
+    default: '3'
+  timeout-seconds:
+    description: Timeout for each HTTP attempt including its response body (1-120).
+    default: '30'
+outputs:
+  NUGET_API_KEY:
+    description: Masked, short-lived NuGet.org API key for use in subsequent steps of the same job.
+runs:
+  using: node24
+  main: src/index.js

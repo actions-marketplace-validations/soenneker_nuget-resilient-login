@@ -1,0 +1,12 @@
+{
+  "name": "nuget-resilient-login",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Authenticate to NuGet.org with GitHub OIDC, bounded retries, request timeouts, and masked credentials.",
+  "license": "MIT",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "check": "node --check src/index.js && node --check src/action.js && node --check src/runtime.js",
+    "test": "node --test"
+  }
+}

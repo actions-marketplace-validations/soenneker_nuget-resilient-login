@@ -1,0 +1,101 @@
+'use strict';
+
+const { setTimeout: sleep } = require('node:timers/promises');
+const { input, mask, output } = require('./runtime');
+
+function integer(value, fallback, minimum, maximum, name) {
+  const result = value === '' ? fallback : Number(value);
+  if (!/^\d+$/.test(value || String(fallback)) || !Number.isSafeInteger(result) || result < minimum || result > maximum)
+    throw new Error(`${name} must be an integer between ${minimum} and ${maximum}.`);
+  return result;
+}
+
+function retryDelay(header, attempt) {
+  let seconds = header === null ? NaN : Number(header);
+  if (!Number.isFinite(seconds) && header) seconds = (Date.parse(header) - Date.now()) / 1000;
+  return Number.isFinite(seconds) ? Math.min(30000, Math.max(0, seconds * 1000)) : Math.min(30000, 1000 * 2 ** attempt);
+}
+
+async function requestJson(url, options, label, settings, fetchImpl, wait) {
+  for (let attempt = 0; attempt <= settings.retries; attempt++) {
+    let response;
+    let body;
+    let transient = false;
+    try {
+      response = await fetchImpl(url, {
+        ...options,
+        redirect: 'error',
+        signal: AbortSignal.timeout(settings.timeout * 1000)
+      });
+      if (response.ok) body = await response.text();
+      else await response.body?.cancel();
+    } catch {
+      // Never include fetch errors, headers, URLs, or response bodies in logs.
+      transient = true;
+    }
+
+    if (!transient && response.ok) {
+      try { return JSON.parse(body); }
+      catch { throw new Error(`${label} returned invalid JSON.`); }
+    }
+
+    transient ||= [408, 429, 500, 502, 503, 504].includes(response.status);
+    if (!transient || attempt === settings.retries) {
+      const status = response ? `HTTP ${response.status}` : 'network error or timeout';
+      const hint = response && [400, 401, 403].includes(response.status)
+        ? ' Check id-token: write, the NuGet policy creator username, repository, workflow filename, and environment in your trusted publishing policy.'
+        : ' Check service availability and runner network access.';
+      throw new Error(`${label} failed (${status}).${hint}`);
+    }
+    await wait(retryDelay(response?.headers.get('retry-after') ?? null, attempt));
+  }
+}
+
+async function run(env = process.env, dependencies = {}) {
+  const fetchImpl = dependencies.fetch || fetch;
+  const wait = dependencies.sleep || sleep;
+  const setSecret = dependencies.mask || mask;
+  const setOutput = dependencies.output || ((name, value) => output(name, value, env));
+  const user = input('user', env);
+  if (!user) throw new Error('The user input must be the NuGet.org username of the trusted publishing policy creator.');
+  const settings = {
+    retries: integer(input('max-retries', env), 3, 0, 5, 'max-retries'),
+    timeout: integer(input('timeout-seconds', env), 30, 1, 120, 'timeout-seconds')
+  };
+
+  const requestToken = env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
+  if (!requestToken || !env.ACTIONS_ID_TOKEN_REQUEST_URL)
+    throw new Error('GitHub OIDC is unavailable. Add permissions: id-token: write to this job.');
+  setSecret(requestToken);
+
+  let requestUrl;
+  try {
+    requestUrl = new URL(env.ACTIONS_ID_TOKEN_REQUEST_URL);
+    if (requestUrl.protocol !== 'https:' || requestUrl.username || requestUrl.password) throw new Error();
+  } catch { throw new Error('GitHub supplied an invalid OIDC request URL; HTTPS is required.'); }
+  requestUrl.searchParams.set('audience', 'https://www.nuget.org');
+
+  const identity = await requestJson(requestUrl, {
+    headers: { Authorization: `Bearer ${requestToken}`, Accept: 'application/json' }
+  }, 'GitHub OIDC request', settings, fetchImpl, wait);
+  if (typeof identity?.value !== 'string' || !identity.value.trim())
+    throw new Error('GitHub OIDC response did not contain a token.');
+  setSecret(identity.value);
+
+  const token = await requestJson('https://www.nuget.org/api/v2/token', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${identity.value}`,
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+      'User-Agent': 'nuget-resilient-login'
+    },
+    body: JSON.stringify({ username: user, tokenType: 'ApiKey' })
+  }, 'NuGet.org token exchange', settings, fetchImpl, wait);
+  if (typeof token?.apiKey !== 'string' || !token.apiKey.trim())
+    throw new Error('NuGet.org response did not contain an API key.');
+  setSecret(token.apiKey);
+  setOutput('NUGET_API_KEY', token.apiKey);
+}
+
+module.exports = { run, retryDelay };
