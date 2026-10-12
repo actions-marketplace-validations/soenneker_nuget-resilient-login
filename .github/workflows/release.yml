@@ -3,7 +3,8 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: New release version (for example 1.0.1 or v1.0.1)
+        description: New release version (for example v2.0.0)
+        default: v2.0.0
         required: true
         type: string
       draft:
@@ -82,6 +83,16 @@ jobs:
             if [[ "$DRAFT" == true ]]; then OPTIONS+=(--draft); fi
             gh release create "$VERSION" --verify-tag --title "$VERSION" --generate-notes "${OPTIONS[@]}"
           fi
+      - name: Update major version tag
+        if: ${{ !inputs.dry-run && !inputs.draft }}
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          MAJOR="v${VERSION#v}"
+          MAJOR="${MAJOR%%.*}"
+          PREVIOUS=$(git ls-remote origin "refs/tags/$MAJOR" | cut -f1)
+          git tag --force "$MAJOR" "$GITHUB_SHA"
+          git push --force-with-lease="refs/tags/$MAJOR:$PREVIOUS" origin "refs/tags/$MAJOR"
       - name: Release summary
         env:
           VERSION: ${{ inputs.version }}

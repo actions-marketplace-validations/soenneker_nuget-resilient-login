@@ -26,7 +26,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       # Build or download your .nupkg files before logging in.
-      - uses: soenneker/nuget-resilient-login@1.0.0
+      - uses: soenneker/nuget-resilient-login@v2
         id: login
         with:
           user: your-nuget-username
