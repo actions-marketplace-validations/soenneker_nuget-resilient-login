@@ -26,7 +26,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       # Build or download your .nupkg files before logging in.
-      - uses: soenneker/nuget-resilient-login@v1.0.0
+      - uses: soenneker/nuget-resilient-login@1.0.0
         id: login
         with:
           user: your-nuget-username
@@ -77,9 +77,18 @@ identity provider and token service; a real trusted-publishing exchange requires
 a GitHub Actions run with a matching NuGet.org policy.
 
 Commit the source files; consumers do not need to install dependencies or build.
-The CI workflow tests on Linux, Windows, and macOS. Run **Draft Marketplace
-release** from `main` with a new tag such as `v1.0.0`. Review its draft, select
-**Publish this Action to the GitHub Marketplace**, choose categories, and publish.
+The CI workflow tests on Linux, Windows, and macOS. Run
+[**Release action**](https://github.com/soenneker/nuget-resilient-login/actions/workflows/release.yml)
+from `main` with a new version such as `1.0.1` (a `v` prefix is also accepted).
+It validates the version, tests on all three platforms, tags the tested commit,
+and publishes a GitHub release with generated release notes. Existing tags are
+never moved. A failed release attempt can be rerun against the same commit.
+Select `draft` to prepare a draft instead, or `dry-run` to test without creating
+a tag or release. No additional secrets are required.
+
+The workflow summary links to the release editor. Select
+**Publish this Action to the GitHub Marketplace**, choose categories, and save.
 The repository must be public, the action name unique, and the repository owner
-must accept the Marketplace Developer Agreement. The release workflow creates
-a draft; it does not publish a Marketplace listing automatically.
+must accept the Marketplace Developer Agreement. GitHub's documented Releases
+API does not expose Marketplace publication, so that final UI step remains
+necessary; publishing a GitHub release alone does not confirm Marketplace listing.

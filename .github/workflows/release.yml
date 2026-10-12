@@ -1,36 +1,96 @@
-name: Draft Marketplace release
+name: Release action
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: New immutable release tag (for example v1.0.0)
+        description: New release version (for example 1.0.1 or v1.0.1)
         required: true
         type: string
+      draft:
+        description: Create a draft instead of publishing the GitHub release
+        type: boolean
+        default: false
+      dry-run:
+        description: Validate and test without creating a tag or release
+        type: boolean
+        default: false
 permissions:
   contents: read
 concurrency:
   group: marketplace-release
   cancel-in-progress: false
 jobs:
-  release:
+  validate:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    steps:
+      - name: Validate version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          [[ "$VERSION" =~ ^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || { echo 'Version must be MAJOR.MINOR.PATCH, optionally prefixed with v'; exit 1; }
+  test:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v7
         with:
           node-version: '24'
           package-manager-cache: false
       - run: npm run check
       - run: npm test
-      - name: Create tag and draft release
+  release:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Check release target
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if git show-ref --verify --quiet "refs/tags/$VERSION"; then
+            [[ "$(git rev-parse "refs/tags/$VERSION^{commit}")" == "$GITHUB_SHA" ]] || { echo 'That version already points to another commit. Choose a new version.'; exit 1; }
+          fi
+      - name: Create tag and release
+        if: ${{ !inputs.dry-run }}
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ inputs.version }}
+          DRAFT: ${{ inputs.draft }}
         run: |
-          [[ "$VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || { echo 'Version must be vMAJOR.MINOR.PATCH'; exit 1; }
-          git tag "$VERSION"
-          git push origin "refs/tags/$VERSION"
-          gh release create "$VERSION" --verify-tag --draft --title "$VERSION" --generate-notes
+          if ! git show-ref --verify --quiet "refs/tags/$VERSION"; then
+            git tag "$VERSION" "$GITHUB_SHA"
+            git push origin "refs/tags/$VERSION"
+          fi
+          if EXISTING_DRAFT=$(gh release view "$VERSION" --json isDraft --jq .isDraft 2>/dev/null); then
+            if [[ "$EXISTING_DRAFT" == true && "$DRAFT" == false ]]; then
+              gh release edit "$VERSION" --draft=false
+            fi
+          else
+            OPTIONS=()
+            if [[ "$DRAFT" == true ]]; then OPTIONS+=(--draft); fi
+            gh release create "$VERSION" --verify-tag --title "$VERSION" --generate-notes "${OPTIONS[@]}"
+          fi
+      - name: Release summary
+        env:
+          VERSION: ${{ inputs.version }}
+          DRY_RUN: ${{ inputs.dry-run }}
+        run: |
+          if [[ "$DRY_RUN" == true ]]; then
+            echo 'Dry run passed on Linux, Windows, and macOS. No tag or release was created.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Release prepared: [$VERSION]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$VERSION)." >> "$GITHUB_STEP_SUMMARY"
+            echo "To publish this version to Marketplace, [edit the release]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/edit/$VERSION), select **Publish this Action to the GitHub Marketplace**, choose categories, and save." >> "$GITHUB_STEP_SUMMARY"
+            echo 'GitHub does not expose Marketplace publication through its documented Releases API.' >> "$GITHUB_STEP_SUMMARY"
+          fi
