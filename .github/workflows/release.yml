@@ -1,37 +1,16 @@
 name: Release action
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
-    inputs:
-      version:
-        description: Major release tag (for example v2)
-        default: v2
-        required: true
-        type: string
-      draft:
-        description: Create a draft instead of publishing the GitHub release
-        type: boolean
-        default: false
-      dry-run:
-        description: Validate and test without creating a tag or release
-        type: boolean
-        default: false
 permissions:
   contents: read
 concurrency:
-  group: marketplace-release
+  group: action-release-${{ github.sha }}
   cancel-in-progress: false
 jobs:
-  validate:
-    if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Validate version
-        env:
-          VERSION: ${{ inputs.version }}
-        run: |
-          [[ "$VERSION" =~ ^v[1-9][0-9]*$ ]] || { echo 'Version must be a major tag such as v2'; exit 1; }
   test:
-    needs: validate
+    if: github.ref == 'refs/heads/main'
     strategy:
       fail-fast: false
       matrix:
@@ -56,38 +35,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - name: Create tag and release
-        if: ${{ !inputs.dry-run }}
+      - name: Publish next version
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ inputs.version }}
-          DRAFT: ${{ inputs.draft }}
-        run: |
-          PREVIOUS=$(git ls-remote origin "refs/tags/$VERSION" | cut -f1)
-          if [[ "$DRAFT" == true && -n "$PREVIOUS" && "$PREVIOUS" != "$GITHUB_SHA" ]]; then
-            echo 'A draft cannot move an existing major tag. Publish the release to update it.'
-            exit 1
-          fi
-          git tag --force "$VERSION" "$GITHUB_SHA"
-          git push --force-with-lease="refs/tags/$VERSION:$PREVIOUS" origin "refs/tags/$VERSION"
-          if EXISTING_DRAFT=$(gh release view "$VERSION" --json isDraft --jq .isDraft 2>/dev/null); then
-            if [[ "$DRAFT" == false ]]; then
-              gh release edit "$VERSION" --title "$VERSION" --draft=false --latest
-            fi
-          else
-            OPTIONS=()
-            if [[ "$DRAFT" == true ]]; then OPTIONS+=(--draft); fi
-            gh release create "$VERSION" --verify-tag --title "$VERSION" --generate-notes "${OPTIONS[@]}"
-          fi
-      - name: Release summary
-        env:
-          VERSION: ${{ inputs.version }}
-          DRY_RUN: ${{ inputs.dry-run }}
-        run: |
-          if [[ "$DRY_RUN" == true ]]; then
-            echo 'Dry run passed on Linux, Windows, and macOS. No tag or release was created.' >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "Release prepared: [$VERSION]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$VERSION)." >> "$GITHUB_STEP_SUMMARY"
-            echo "To publish this version to Marketplace, [edit the release]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/edit/$VERSION), select **Publish this Action to the GitHub Marketplace**, choose categories, and save." >> "$GITHUB_STEP_SUMMARY"
-            echo 'GitHub does not expose Marketplace publication through its documented Releases API.' >> "$GITHUB_STEP_SUMMARY"
-          fi
+        run: bash .github/scripts/release.sh
