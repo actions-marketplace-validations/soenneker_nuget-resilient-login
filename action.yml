@@ -2,7 +2,7 @@ name: "NuGet Resilient Login"
 description: "Authenticate to NuGet.org with GitHub OIDC, bounded retries, request timeouts, and masked credentials."
 author: 'soenneker'
 branding:
-  icon: "key"
+  icon: "log-in"
   color: "blue"
 inputs:
   user:
