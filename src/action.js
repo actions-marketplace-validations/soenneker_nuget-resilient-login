@@ -18,12 +18,14 @@ function retryDelay(header, attempt) {
 
 async function requestJson(url, options, label, settings, fetchImpl, wait) {
   for (let attempt = 0; attempt <= settings.retries; attempt++) {
+    // Token exchange retries must acquire a fresh, single-use OIDC token.
+    const requestOptions = typeof options === 'function' ? await options() : options;
     let response;
     let body;
     let transient = false;
     try {
       response = await fetchImpl(url, {
-        ...options,
+        ...requestOptions,
         redirect: 'error',
         signal: AbortSignal.timeout(settings.timeout * 1000)
       });
@@ -60,8 +62,15 @@ async function run(env = process.env, dependencies = {}) {
   if (!user) throw new Error('The user input must be the NuGet.org username of the trusted publishing policy creator.');
   const settings = {
     retries: integer(input('max-retries', env), 3, 0, 5, 'max-retries'),
-    timeout: integer(input('timeout-seconds', env), 30, 1, 120, 'timeout-seconds')
+    timeout: integer(input('timeout-seconds', env), 180, 1, 600, 'timeout-seconds')
   };
+  const audience = input('audience', env) || 'https://www.nuget.org';
+  let tokenServiceUrl;
+  try {
+    tokenServiceUrl = new URL(input('token-service-url', env) || 'https://www.nuget.org/api/v2/token');
+    if (tokenServiceUrl.protocol !== 'https:' || tokenServiceUrl.username || tokenServiceUrl.password || tokenServiceUrl.hash)
+      throw new Error();
+  } catch { throw new Error('token-service-url must be an HTTPS URL without embedded credentials or a fragment.'); }
 
   const requestToken = env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
   if (!requestToken || !env.ACTIONS_ID_TOKEN_REQUEST_URL)
@@ -73,25 +82,27 @@ async function run(env = process.env, dependencies = {}) {
     requestUrl = new URL(env.ACTIONS_ID_TOKEN_REQUEST_URL);
     if (requestUrl.protocol !== 'https:' || requestUrl.username || requestUrl.password) throw new Error();
   } catch { throw new Error('GitHub supplied an invalid OIDC request URL; HTTPS is required.'); }
-  requestUrl.searchParams.set('audience', 'https://www.nuget.org');
+  requestUrl.searchParams.set('audience', audience);
 
-  const identity = await requestJson(requestUrl, {
-    headers: { Authorization: `Bearer ${requestToken}`, Accept: 'application/json' }
-  }, 'GitHub OIDC request', settings, fetchImpl, wait);
-  if (typeof identity?.value !== 'string' || !identity.value.trim())
-    throw new Error('GitHub OIDC response did not contain a token.');
-  setSecret(identity.value);
+  const token = await requestJson(tokenServiceUrl, async () => {
+    const identity = await requestJson(requestUrl, {
+      headers: { Authorization: `Bearer ${requestToken}`, Accept: 'application/json' }
+    }, 'GitHub OIDC request', settings, fetchImpl, wait);
+    if (typeof identity?.value !== 'string' || !identity.value.trim())
+      throw new Error('GitHub OIDC response did not contain a token.');
+    setSecret(identity.value);
 
-  const token = await requestJson('https://www.nuget.org/api/v2/token', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${identity.value}`,
-      'Content-Type': 'application/json',
-      Accept: 'application/json',
-      'User-Agent': 'nuget-resilient-login'
-    },
-    body: JSON.stringify({ username: user, tokenType: 'ApiKey' })
-  }, 'NuGet.org token exchange', settings, fetchImpl, wait);
+    return {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${identity.value}`,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        'User-Agent': 'nuget-resilient-login'
+      },
+      body: JSON.stringify({ username: user, tokenType: 'ApiKey' })
+    };
+  }, 'NuGet token exchange', settings, fetchImpl, wait);
   if (typeof token?.apiKey !== 'string' || !token.apiKey.trim())
     throw new Error('NuGet.org response did not contain an API key.');
   setSecret(token.apiKey);

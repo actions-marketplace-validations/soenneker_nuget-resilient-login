@@ -51,10 +51,11 @@ test('retries throttling and network failures with bounded delays', async () => 
   assert.equal(retryDelay('0', 0), 0);
 });
 
-test('retries transient token-exchange failures', async () => {
-  const context = harness([json({ value: 'oidc' }), json({}, 503), json({ apiKey: 'key' })]);
+test('obtains a fresh OIDC token for each token-exchange retry', async () => {
+  const context = harness([json({ value: 'oidc' }), json({}, 503), json({ value: 'fresh-oidc' }), json({ apiKey: 'key' })]);
   await run(environment, context);
-  assert.equal(context.calls.length, 3);
+  assert.equal(context.calls.length, 4);
+  assert.equal(context.calls[3].options.headers.Authorization, 'Bearer fresh-oidc');
   assert.deepEqual(context.waits, [1000]);
 });
 
@@ -76,12 +77,33 @@ test('validates permissions, numeric settings, and HTTPS before making requests'
   for (const invalid of [
     { ACTIONS_ID_TOKEN_REQUEST_TOKEN: '' }, { INPUT_USER: '' },
     { 'INPUT_MAX-RETRIES': '6' }, { 'INPUT_TIMEOUT-SECONDS': '0' },
+    { 'INPUT_TIMEOUT-SECONDS': '601' }, { 'INPUT_TOKEN-SERVICE-URL': 'http://example.com/token' },
     { 'INPUT_TIMEOUT-SECONDS': '1.5' }, { ACTIONS_ID_TOKEN_REQUEST_URL: 'http://example.com' }
   ]) {
     const context = harness([]);
     await assert.rejects(run({ ...environment, ...invalid }, context));
     assert.equal(context.calls.length, 0);
   }
+});
+
+test('uses upstream defaults with only user supplied and allows timeout overrides', async t => {
+  const durations = [];
+  t.mock.method(AbortSignal, 'timeout', milliseconds => {
+    durations.push(milliseconds);
+    return new AbortController().signal;
+  });
+  await run(environment, harness([json({ value: 'oidc' }), json({ apiKey: 'key' })]));
+  assert.deepEqual(durations, [180000, 180000]);
+  durations.length = 0;
+  await run({ ...environment, 'INPUT_TIMEOUT-SECONDS': '300' }, harness([json({ value: 'oidc' }), json({ apiKey: 'key' })]));
+  assert.deepEqual(durations, [300000, 300000]);
+});
+
+test('supports the upstream audience and token-service-url inputs', async () => {
+  const context = harness([json({ value: 'oidc' }), json({ apiKey: 'key' })]);
+  await run({ ...environment, INPUT_AUDIENCE: 'https://packages.example.com', 'INPUT_TOKEN-SERVICE-URL': 'https://packages.example.com/token' }, context);
+  assert.equal(new URL(context.calls[0].url).searchParams.get('audience'), 'https://packages.example.com');
+  assert.equal(context.calls[1].url, 'https://packages.example.com/token');
 });
 
 test('rejects malformed JSON and missing tokens without emitting outputs', async () => {

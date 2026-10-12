@@ -5,6 +5,9 @@ Authenticate to NuGet.org with GitHub OIDC, bounded retries, request timeouts, a
 Exchanges a GitHub OIDC token for a short-lived NuGet.org API key. Supports
 bounded retries, per-attempt timeouts, and secret masking without third-party
 runtime dependencies. Runs on Linux, Windows, and macOS using Node.js 24.
+GitHub's runner provides the action runtime; consumers do not need a setup-node
+step. Like `NuGet/login`, only `user` is required. Self-hosted runners must support
+Node 24 JavaScript actions; arbitrary operating systems are not supported.
 
 ## Usage
 
@@ -37,18 +40,30 @@ jobs:
 Use a full commit SHA instead of a version tag when you need an immutable pin.
 Log in immediately before publishing. The API key is a masked step output for
 subsequent steps in the same job; it is not written to NuGet configuration.
-The action authenticates only to NuGet.org and does not restore or push packages.
+The action defaults to NuGet.org and does not restore or push packages.
 
 | Input | Default | Purpose |
 | --- | --- | --- |
 | `user` | Required | NuGet.org username of the policy creator |
+| `token-service-url` | `https://www.nuget.org/api/v2/token` | HTTPS exchange endpoint, as in `NuGet/login` |
+| `audience` | `https://www.nuget.org` | OIDC audience, as in `NuGet/login` |
 | `max-retries` | `3` | Retries per request, from 0 through 5 |
-| `timeout-seconds` | `30` | Per-attempt timeout, from 1 through 120 seconds |
+| `timeout-seconds` | `180` | Per-attempt timeout, from 1 through 600 seconds |
+
+The default timeout duration matches the HTTP client's 180-second default used
+by `NuGet/login`. Ours is a deadline for the whole HTTP attempt, including reading
+the body; upstream uses a socket inactivity timeout. Set `timeout-seconds: '300'`
+if you want five minutes per attempt. Retries are additional attempts, not part
+of a single overall deadline. This setting does not change the issued key's
+lifetime: NuGet.org currently issues keys valid for one hour.
 
 Output: `NUGET_API_KEY`, compatible with workflows using `NuGet/login`.
 Network failures and HTTP 408, 429, 500, 502, 503, and 504 are retried with
 exponential backoff or Retry-After, capped at 30 seconds per delay. Other failures
 stop immediately. Response bodies and credentials are never included in errors.
+Each token-exchange retry requests a fresh OIDC token because NuGet.org tokens
+are single-use. Set a custom endpoint only for a token service you trust: it
+receives the OIDC credential.
 Requests refuse redirects. Proxies and custom CA settings must be configured for
 Node's native fetch on self-hosted runners.
 

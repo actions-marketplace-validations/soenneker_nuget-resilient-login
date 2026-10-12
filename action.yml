@@ -8,12 +8,18 @@ inputs:
   user:
     description: NuGet.org username of the trusted publishing policy creator.
     required: true
+  token-service-url:
+    description: HTTPS token exchange endpoint, matching NuGet/login.
+    default: 'https://www.nuget.org/api/v2/token'
+  audience:
+    description: OIDC audience, matching NuGet/login.
+    default: 'https://www.nuget.org'
   max-retries:
     description: Retries per request for transient network failures, throttling, and server errors (0-5).
     default: '3'
   timeout-seconds:
-    description: Timeout for each HTTP attempt including its response body (1-120).
-    default: '30'
+    description: Timeout for each HTTP attempt including its response body (1-600 seconds). Defaults to the upstream HTTP client's 180-second duration.
+    default: '180'
 outputs:
   NUGET_API_KEY:
     description: Masked, short-lived NuGet.org API key for use in subsequent steps of the same job.
