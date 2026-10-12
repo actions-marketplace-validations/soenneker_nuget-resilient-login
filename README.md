@@ -59,7 +59,9 @@ lifetime: NuGet.org currently issues keys valid for one hour.
 
 Output: `NUGET_API_KEY`, compatible with workflows using `NuGet/login`.
 Network failures and HTTP 408, 429, 500, 502, 503, and 504 are retried with
-exponential backoff with jitter, capped at 30 seconds per delay. Valid Retry-After
+exponential backoff with jitter, capped at 30 seconds per delay. HTTP 500 uses
+longer backoff: 30, 60, then 120 seconds (plus jitter, capped at 120 seconds),
+giving the default three retries about three and a half minutes to recover. Valid Retry-After
 values are honored up to five minutes; longer requested delays stop the action
 so it never retries earlier than the server permits. Retry counts and delays
 are logged without credentials or response bodies. Other failures

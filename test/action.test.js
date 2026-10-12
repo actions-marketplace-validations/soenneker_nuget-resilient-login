@@ -199,3 +199,29 @@ test('the request deadline covers a stalled response body', async t => {
   await assert.rejects(run({ ...environment, 'INPUT_MAX-RETRIES': '0' }, context), /network error or timeout/);
   assert.ok(context.events.every(event => event[0] !== 'output'));
 });
+
+
+test('spreads HTTP 500 retries over a longer recovery period without increasing attempts', async () => {
+  const context = harness(Array.from({ length: 4 }, () => json({}, 500)));
+  await assert.rejects(run(environment, context), /GitHub OIDC request failed \(HTTP 500\)/);
+  assert.deepEqual(context.waits, [30000, 60000, 120000]);
+  assert.equal(context.calls.length, 4);
+  assert.ok(context.events.every(event => event[0] !== 'output'));
+});
+
+test('recovers from an exchange HTTP 500 with a fresh identity after the longer delay', async () => {
+  const context = harness([json({ value: 'old' }), json({}, 500), json({ value: 'fresh' }), json({ apiKey: 'key' })]);
+  await run(environment, context);
+  assert.deepEqual(context.waits, [30000]);
+  assert.equal(context.calls[3].options.headers.Authorization, 'Bearer fresh');
+});
+
+test('honors Retry-After on HTTP 500 and keeps other transient HTTP delays unchanged', async () => {
+  for (const status of [408, 429, 502, 503, 504, 500]) {
+    const context = harness([json({}, status, status === 500 ? { 'retry-after': '15' } : {}), json({ value: 'oidc' }), json({ apiKey: 'key' })]);
+    await run(environment, context);
+    assert.deepEqual(context.waits, [status === 500 ? 15000 : 1000]);
+  }
+  assert.equal(retryDelay(null, 0, () => 0.5, 0, 500), 30125);
+  assert.equal(retryDelay(null, 5, () => 0.5, 0, 500), 120000);
+});

@@ -10,7 +10,7 @@ function integer(value, fallback, minimum, maximum, name) {
   return result;
 }
 
-function retryDelay(header, attempt, random = Math.random, now = Date.now()) {
+function retryDelay(header, attempt, random = Math.random, now = Date.now(), status) {
   const value = header?.trim();
   let seconds = value && /^\d+$/.test(value) ? Number(value) : NaN;
   if (seconds === Infinity) throw new Error('The service requested a Retry-After delay longer than 300 seconds. Retry the workflow later.');
@@ -20,7 +20,9 @@ function retryDelay(header, attempt, random = Math.random, now = Date.now()) {
     if (seconds > 300) throw new Error('The service requested a Retry-After delay longer than 300 seconds. Retry the workflow later.');
     return Math.max(0, seconds * 1000);
   }
-  return Math.min(30000, 1000 * 2 ** attempt + Math.floor(random() * 250));
+  const baseDelay = status === 500 ? 30000 : 1000;
+  const maximumDelay = status === 500 ? 120000 : 30000;
+  return Math.min(maximumDelay, baseDelay * 2 ** attempt + Math.floor(random() * 250));
 }
 
 async function requestJson(url, options, label, settings, fetchImpl, wait) {
@@ -59,7 +61,7 @@ async function requestJson(url, options, label, settings, fetchImpl, wait) {
         : ' Check service availability and runner network access.';
       throw new Error(`${label} failed (${status}).${hint}`);
     }
-    const delay = retryDelay(response?.headers.get('retry-after') ?? null, attempt, settings.random);
+    const delay = retryDelay(response?.headers.get('retry-after') ?? null, attempt, settings.random, Date.now(), response?.status);
     settings.info(`${label}: retry ${attempt + 1}/${settings.retries} in ${delay}ms (${response && !response.ok ? `HTTP ${response.status}` : 'network error or timeout'}).`);
     await wait(delay);
   }
