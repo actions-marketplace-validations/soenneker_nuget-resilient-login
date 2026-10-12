@@ -13,9 +13,11 @@ const environment = {
 const json = (body, status = 200, headers = {}) => new Response(JSON.stringify(body), { status, headers });
 
 function harness(responses) {
-  const calls = [], events = [], waits = [];
+  const calls = [], events = [], waits = [], logs = [];
   return {
-    calls, events, waits,
+    calls, events, waits, logs,
+    random: () => 0,
+    info: message => logs.push(message),
     fetch: async (url, options) => {
       calls.push({ url: String(url), options });
       const response = responses.shift();
@@ -38,16 +40,18 @@ test('exchanges OIDC with the required audience and masks all credentials before
   assert.equal(context.calls[1].url, 'https://www.nuget.org/api/v2/token');
   assert.deepEqual(JSON.parse(context.calls[1].options.body), { username: 'policy-creator', tokenType: 'ApiKey' });
   assert.equal(context.calls[1].options.headers.Authorization, 'Bearer identity-secret');
-  assert.ok(context.calls.every(call => call.options.redirect === 'error' && call.options.signal instanceof AbortSignal));
+  assert.ok(context.calls.every(call => call.options.redirect === 'manual' && call.options.signal instanceof AbortSignal));
   assert.deepEqual(context.events, [
     ['mask', 'request-secret'], ['mask', 'identity-secret'], ['mask', 'api-secret'], ['output', 'NUGET_API_KEY', 'api-secret']
   ]);
 });
 
 test('retries throttling and network failures with bounded delays', async () => {
-  const context = harness([json({}, 429, { 'retry-after': '999' }), new Error('private network details'), json({ value: 'oidc' }), json({ apiKey: 'key' })]);
+  const context = harness([json({}, 429, { 'retry-after': '120' }), new Error('private network details'), json({ value: 'oidc' }), json({ apiKey: 'key' })]);
   await run(environment, context);
-  assert.deepEqual(context.waits, [30000, 2000]);
+  assert.deepEqual(context.waits, [120000, 2000]);
+  assert.equal(context.logs.length, 2);
+  assert.ok(context.logs.every(message => !message.includes('secret') && !message.includes('private network details')));
   assert.equal(retryDelay('0', 0), 0);
 });
 
@@ -117,4 +121,81 @@ test('rejects malformed JSON and missing tokens without emitting outputs', async
 
 test('escapes workflow command control characters', () => {
   assert.equal(escapeCommand('a%\r\n::error::b'), 'a%25%0D%0A::error::b');
+});
+
+test('honors Retry-After dates, rejects excessive delays, and adds bounded jitter', () => {
+  const now = Date.parse('Mon, 12 Oct 2026 12:00:00 GMT');
+  assert.equal(retryDelay('Mon, 12 Oct 2026 12:02:00 GMT', 0, () => 0, now), 120000);
+  assert.equal(retryDelay('Mon, 12 Oct 2026 11:59:00 GMT', 0, () => 0, now), 0);
+  assert.equal(retryDelay('invalid', 0, () => 0.5), 1125);
+  assert.equal(retryDelay('-1', 0, () => 0), 1000);
+  assert.equal(retryDelay(' ', 0, () => 0), 1000);
+  assert.equal(retryDelay(null, 5, () => 0.99), 30000);
+  assert.throws(() => retryDelay('301', 0), /longer than 300/);
+  assert.throws(() => retryDelay('9'.repeat(400), 0), /longer than 300/);
+});
+
+test('does not retry before an excessive Retry-After period', async () => {
+  const context = harness([json({}, 429, { 'retry-after': '301' })]);
+  await assert.rejects(run(environment, context), /Retry the workflow later/);
+  assert.equal(context.calls.length, 1);
+  assert.deepEqual(context.waits, []);
+});
+
+test('does not retry authentication failures when response cleanup fails', async () => {
+  const context = harness([{
+    ok: false, status: 403, headers: new Headers(),
+    body: { cancel: async () => { throw new Error('sensitive cleanup failure'); } }
+  }]);
+  await assert.rejects(run(environment, context), /HTTP 403/);
+  assert.equal(context.calls.length, 1);
+  assert.deepEqual(context.waits, []);
+});
+
+test('refuses redirects without forwarding credentials or retrying', async () => {
+  const context = harness([json({}, 302, { location: 'https://untrusted.example/token' })]);
+  await assert.rejects(run(environment, context), /HTTP 302/);
+  assert.equal(context.calls.length, 1);
+  assert.deepEqual(context.waits, []);
+});
+
+test('refreshes identity after an interrupted successful exchange response', async () => {
+  const interrupted = { ok: true, status: 200, headers: new Headers(), text: async () => { throw new Error('secret-body'); } };
+  const context = harness([json({ value: 'old-identity' }), interrupted, json({ value: 'new-identity' }), json({ apiKey: 'key' })]);
+  await run(environment, context);
+  assert.equal(context.calls[3].options.headers.Authorization, 'Bearer new-identity');
+  assert.ok(context.logs[0].includes('network error or timeout'));
+  assert.ok(!context.logs[0].includes('secret-body'));
+});
+
+test('reports interrupted response bodies as transport failures instead of HTTP 200', async () => {
+  const context = harness([{ ok: true, status: 200, text: async () => { throw new Error('secret-body'); } }]);
+  await assert.rejects(run({ ...environment, 'INPUT_MAX-RETRIES': '0' }, context), error =>
+    error.message.includes('network error or timeout') && !error.message.includes('HTTP 200') && !error.message.includes('secret-body'));
+});
+
+test('fails before requesting credentials when GitHub output is unavailable', async () => {
+  const context = harness([]);
+  delete context.output;
+  await assert.rejects(run(environment, context), /GITHUB_OUTPUT/);
+  assert.equal(context.calls.length, 0);
+});
+
+test('the request deadline covers a stalled response body', async t => {
+  const timers = [];
+  t.after(() => timers.forEach(clearTimeout));
+  t.mock.method(AbortSignal, 'timeout', () => {
+    const controller = new AbortController();
+    timers.push(setTimeout(() => controller.abort(), 10));
+    return controller.signal;
+  });
+  const context = harness([]);
+  context.fetch = async (_url, options) => ({
+    ok: true, status: 200,
+    text: () => new Promise((_resolve, reject) => {
+      options.signal.addEventListener('abort', () => reject(new Error('private timeout details')), { once: true });
+    })
+  });
+  await assert.rejects(run({ ...environment, 'INPUT_MAX-RETRIES': '0' }, context), /network error or timeout/);
+  assert.ok(context.events.every(event => event[0] !== 'output'));
 });

@@ -59,7 +59,10 @@ lifetime: NuGet.org currently issues keys valid for one hour.
 
 Output: `NUGET_API_KEY`, compatible with workflows using `NuGet/login`.
 Network failures and HTTP 408, 429, 500, 502, 503, and 504 are retried with
-exponential backoff or Retry-After, capped at 30 seconds per delay. Other failures
+exponential backoff with jitter, capped at 30 seconds per delay. Valid Retry-After
+values are honored up to five minutes; longer requested delays stop the action
+so it never retries earlier than the server permits. Retry counts and delays
+are logged without credentials or response bodies. Other failures
 stop immediately. Response bodies and credentials are never included in errors.
 Each token-exchange retry requests a fresh OIDC token because NuGet.org tokens
 are single-use. Set a custom endpoint only for a token service you trust: it

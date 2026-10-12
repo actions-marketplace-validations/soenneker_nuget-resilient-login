@@ -10,10 +10,17 @@ function integer(value, fallback, minimum, maximum, name) {
   return result;
 }
 
-function retryDelay(header, attempt) {
-  let seconds = header === null ? NaN : Number(header);
-  if (!Number.isFinite(seconds) && header) seconds = (Date.parse(header) - Date.now()) / 1000;
-  return Number.isFinite(seconds) ? Math.min(30000, Math.max(0, seconds * 1000)) : Math.min(30000, 1000 * 2 ** attempt);
+function retryDelay(header, attempt, random = Math.random, now = Date.now()) {
+  const value = header?.trim();
+  let seconds = value && /^\d+$/.test(value) ? Number(value) : NaN;
+  if (seconds === Infinity) throw new Error('The service requested a Retry-After delay longer than 300 seconds. Retry the workflow later.');
+  if (value && !Number.isFinite(seconds) && /^[A-Za-z]{3}, /.test(value))
+    seconds = (Date.parse(value) - now) / 1000;
+  if (Number.isFinite(seconds)) {
+    if (seconds > 300) throw new Error('The service requested a Retry-After delay longer than 300 seconds. Retry the workflow later.');
+    return Math.max(0, seconds * 1000);
+  }
+  return Math.min(30000, 1000 * 2 ** attempt + Math.floor(random() * 250));
 }
 
 async function requestJson(url, options, label, settings, fetchImpl, wait) {
@@ -26,11 +33,14 @@ async function requestJson(url, options, label, settings, fetchImpl, wait) {
     try {
       response = await fetchImpl(url, {
         ...requestOptions,
-        redirect: 'error',
+        redirect: 'manual',
         signal: AbortSignal.timeout(settings.timeout * 1000)
       });
       if (response.ok) body = await response.text();
-      else await response.body?.cancel();
+      // Cleanup must not turn a definitive HTTP rejection into a retryable error.
+      else {
+        try { await response.body?.cancel(); } catch { /* The HTTP status remains authoritative. */ }
+      }
     } catch {
       // Never include fetch errors, headers, URLs, or response bodies in logs.
       transient = true;
@@ -43,13 +53,15 @@ async function requestJson(url, options, label, settings, fetchImpl, wait) {
 
     transient ||= [408, 429, 500, 502, 503, 504].includes(response.status);
     if (!transient || attempt === settings.retries) {
-      const status = response ? `HTTP ${response.status}` : 'network error or timeout';
+      const status = transient && (!response || response.ok) ? 'network error or timeout' : `HTTP ${response.status}`;
       const hint = response && [400, 401, 403].includes(response.status)
         ? ' Check id-token: write, the NuGet policy creator username, repository, workflow filename, and environment in your trusted publishing policy.'
         : ' Check service availability and runner network access.';
       throw new Error(`${label} failed (${status}).${hint}`);
     }
-    await wait(retryDelay(response?.headers.get('retry-after') ?? null, attempt));
+    const delay = retryDelay(response?.headers.get('retry-after') ?? null, attempt, settings.random);
+    settings.info(`${label}: retry ${attempt + 1}/${settings.retries} in ${delay}ms (${response && !response.ok ? `HTTP ${response.status}` : 'network error or timeout'}).`);
+    await wait(delay);
   }
 }
 
@@ -58,11 +70,15 @@ async function run(env = process.env, dependencies = {}) {
   const wait = dependencies.sleep || sleep;
   const setSecret = dependencies.mask || mask;
   const setOutput = dependencies.output || ((name, value) => output(name, value, env));
+  if (!dependencies.output && !env.GITHUB_OUTPUT)
+    throw new Error('GITHUB_OUTPUT is unavailable. Run this action in a GitHub Actions step.');
   const user = input('user', env);
   if (!user) throw new Error('The user input must be the NuGet.org username of the trusted publishing policy creator.');
   const settings = {
     retries: integer(input('max-retries', env), 3, 0, 5, 'max-retries'),
-    timeout: integer(input('timeout-seconds', env), 240, 1, 600, 'timeout-seconds')
+    timeout: integer(input('timeout-seconds', env), 240, 1, 600, 'timeout-seconds'),
+    random: dependencies.random || Math.random,
+    info: dependencies.info || (message => process.stdout.write(`${message}\n`))
   };
   const audience = input('audience', env) || 'https://www.nuget.org';
   let tokenServiceUrl;
