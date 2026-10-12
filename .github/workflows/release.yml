@@ -3,8 +3,8 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: New release version (for example v2.0.0)
-        default: v2.0.0
+        description: Major release tag (for example v2)
+        default: v2
         required: true
         type: string
       draft:
@@ -29,7 +29,7 @@ jobs:
         env:
           VERSION: ${{ inputs.version }}
         run: |
-          [[ "$VERSION" =~ ^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || { echo 'Version must be MAJOR.MINOR.PATCH, optionally prefixed with v'; exit 1; }
+          [[ "$VERSION" =~ ^v[1-9][0-9]*$ ]] || { echo 'Version must be a major tag such as v2'; exit 1; }
   test:
     needs: validate
     strategy:
@@ -56,13 +56,6 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - name: Check release target
-        env:
-          VERSION: ${{ inputs.version }}
-        run: |
-          if git show-ref --verify --quiet "refs/tags/$VERSION"; then
-            [[ "$(git rev-parse "refs/tags/$VERSION^{commit}")" == "$GITHUB_SHA" ]] || { echo 'That version already points to another commit. Choose a new version.'; exit 1; }
-          fi
       - name: Create tag and release
         if: ${{ !inputs.dry-run }}
         env:
@@ -70,29 +63,22 @@ jobs:
           VERSION: ${{ inputs.version }}
           DRAFT: ${{ inputs.draft }}
         run: |
-          if ! git show-ref --verify --quiet "refs/tags/$VERSION"; then
-            git tag "$VERSION" "$GITHUB_SHA"
-            git push origin "refs/tags/$VERSION"
+          PREVIOUS=$(git ls-remote origin "refs/tags/$VERSION" | cut -f1)
+          if [[ "$DRAFT" == true && -n "$PREVIOUS" && "$PREVIOUS" != "$GITHUB_SHA" ]]; then
+            echo 'A draft cannot move an existing major tag. Publish the release to update it.'
+            exit 1
           fi
+          git tag --force "$VERSION" "$GITHUB_SHA"
+          git push --force-with-lease="refs/tags/$VERSION:$PREVIOUS" origin "refs/tags/$VERSION"
           if EXISTING_DRAFT=$(gh release view "$VERSION" --json isDraft --jq .isDraft 2>/dev/null); then
-            if [[ "$EXISTING_DRAFT" == true && "$DRAFT" == false ]]; then
-              gh release edit "$VERSION" --draft=false
+            if [[ "$DRAFT" == false ]]; then
+              gh release edit "$VERSION" --title "$VERSION" --draft=false --latest
             fi
           else
             OPTIONS=()
             if [[ "$DRAFT" == true ]]; then OPTIONS+=(--draft); fi
             gh release create "$VERSION" --verify-tag --title "$VERSION" --generate-notes "${OPTIONS[@]}"
           fi
-      - name: Update major version tag
-        if: ${{ !inputs.dry-run && !inputs.draft }}
-        env:
-          VERSION: ${{ inputs.version }}
-        run: |
-          MAJOR="v${VERSION#v}"
-          MAJOR="${MAJOR%%.*}"
-          PREVIOUS=$(git ls-remote origin "refs/tags/$MAJOR" | cut -f1)
-          git tag --force "$MAJOR" "$GITHUB_SHA"
-          git push --force-with-lease="refs/tags/$MAJOR:$PREVIOUS" origin "refs/tags/$MAJOR"
       - name: Release summary
         env:
           VERSION: ${{ inputs.version }}
