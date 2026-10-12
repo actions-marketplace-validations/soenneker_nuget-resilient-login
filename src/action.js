@@ -62,7 +62,7 @@ async function run(env = process.env, dependencies = {}) {
   if (!user) throw new Error('The user input must be the NuGet.org username of the trusted publishing policy creator.');
   const settings = {
     retries: integer(input('max-retries', env), 3, 0, 5, 'max-retries'),
-    timeout: integer(input('timeout-seconds', env), 180, 1, 600, 'timeout-seconds')
+    timeout: integer(input('timeout-seconds', env), 240, 1, 600, 'timeout-seconds')
   };
   const audience = input('audience', env) || 'https://www.nuget.org';
   let tokenServiceUrl;

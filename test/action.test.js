@@ -86,14 +86,14 @@ test('validates permissions, numeric settings, and HTTPS before making requests'
   }
 });
 
-test('uses upstream defaults with only user supplied and allows timeout overrides', async t => {
+test('defaults to 240 seconds with only user supplied and allows timeout overrides', async t => {
   const durations = [];
   t.mock.method(AbortSignal, 'timeout', milliseconds => {
     durations.push(milliseconds);
     return new AbortController().signal;
   });
   await run(environment, harness([json({ value: 'oidc' }), json({ apiKey: 'key' })]));
-  assert.deepEqual(durations, [180000, 180000]);
+  assert.deepEqual(durations, [240000, 240000]);
   durations.length = 0;
   await run({ ...environment, 'INPUT_TIMEOUT-SECONDS': '300' }, harness([json({ value: 'oidc' }), json({ apiKey: 'key' })]));
   assert.deepEqual(durations, [300000, 300000]);

@@ -48,11 +48,11 @@ The action defaults to NuGet.org and does not restore or push packages.
 | `token-service-url` | `https://www.nuget.org/api/v2/token` | HTTPS exchange endpoint, as in `NuGet/login` |
 | `audience` | `https://www.nuget.org` | OIDC audience, as in `NuGet/login` |
 | `max-retries` | `3` | Retries per request, from 0 through 5 |
-| `timeout-seconds` | `180` | Per-attempt timeout, from 1 through 600 seconds |
+| `timeout-seconds` | `240` | Per-attempt timeout, from 1 through 600 seconds |
 
-The default timeout duration matches the HTTP client's 180-second default used
-by `NuGet/login`. Ours is a deadline for the whole HTTP attempt, including reading
-the body; upstream uses a socket inactivity timeout. Set `timeout-seconds: '300'`
+The default timeout is 240 seconds (four minutes) for the whole HTTP attempt,
+including reading the body. `NuGet/login` uses a 180-second socket inactivity
+timeout. Set `timeout-seconds: '300'`
 if you want five minutes per attempt. Retries are additional attempts, not part
 of a single overall deadline. This setting does not change the issued key's
 lifetime: NuGet.org currently issues keys valid for one hour.
