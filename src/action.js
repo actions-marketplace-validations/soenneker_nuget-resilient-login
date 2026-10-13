@@ -111,7 +111,7 @@ async function run(env = process.env, dependencies = {}) {
     throw new Error('GITHUB_OUTPUT is unavailable. Run this action in a GitHub Actions step.');
   const user = input('user', env);
   if (!user) throw new Error('The user input must be the NuGet.org username of the trusted publishing policy creator.');
-  const logResponses = input('log-responses', env) || 'false';
+  const logResponses = input('log-responses', env) || 'true';
   if (!['true', 'false'].includes(logResponses)) throw new Error('log-responses must be true or false.');
   const now = dependencies.now || (() => performance.now());
   const settings = {

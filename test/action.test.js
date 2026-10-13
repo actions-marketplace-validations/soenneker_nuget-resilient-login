@@ -331,8 +331,11 @@ test('stalled diagnostic bodies preserve nonretryable HTTP status', async t => {
 });
 
 
-test('response diagnostics are opt-in and invalid options fail before network access', async () => {
-  for (const value of [undefined, 'false']) {
+test('response diagnostics default on, can be disabled, and reject invalid options', async () => {
+  const enabled = harness([Response.json({ error: 'Diagnostic message' }, { status: 403 })]);
+  await assert.rejects(run(environment, enabled), /HTTP 403/);
+  assert.ok(enabled.logs.some(log => log.includes('Diagnostic message')));
+  for (const value of ['false']) {
     const context = harness([{ ok: false, status: 403, headers: new Headers({ 'x-request-id': 'private-id' }),
       body: { cancel: async () => {}, getReader: () => { assert.fail('Disabled diagnostics read the body'); } } }]);
     await assert.rejects(run({ ...environment, 'INPUT_LOG-RESPONSES': value }, context), /HTTP 403/);
