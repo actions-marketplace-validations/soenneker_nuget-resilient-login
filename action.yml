@@ -15,7 +15,7 @@ inputs:
     description: OIDC audience, matching NuGet/login.
     default: 'https://www.nuget.org'
   log-responses:
-    description: Log sanitized error messages and selected diagnostic response headers. Successful response bodies are never logged.
+    description: Log HTTP failure summaries, body-read status, sanitized JSON or plain-text error excerpts, and selected headers. Successful response bodies are never logged.
     default: 'true'
   max-retries:
     description: NuGet retries for transient failures (0-5). GitHub OIDC uses at most two retries, or this value when lower.

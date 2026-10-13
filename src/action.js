@@ -66,6 +66,7 @@ async function requestJson(url, options, label, settings, fetchImpl, wait) {
             }, AbortSignal.timeout(2000));
           } catch {
             // Stop stalled diagnostic reads without changing the definitive HTTP status.
+            diagnosticMessage = { bodyStatus: 'timeout' };
             controller.abort();
           }
         }
@@ -79,9 +80,8 @@ async function requestJson(url, options, label, settings, fetchImpl, wait) {
 
     settings.info(`${label}: attempt ${attempt + 1}/${settings.retries + 1} completed in ${Math.round(settings.now() - started)}ms (${status}).`);
     if (settings.logResponses && response && !response.ok) {
-      const details = responseHeaders(response, settings.secrets);
-      if (diagnosticMessage) details.message = diagnosticMessage;
-      if (Object.keys(details).length) settings.info(`${label}: response diagnostics ${JSON.stringify(details)}`);
+      const details = { httpStatus: response.status, ...responseHeaders(response, settings.secrets), ...(diagnosticMessage || { bodyStatus: 'unavailable' }) };
+      settings.info(`${label}: response diagnostics ${JSON.stringify(details)}`);
     }
 
     if (!transportFailure && response.ok) {

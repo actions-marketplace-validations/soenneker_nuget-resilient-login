@@ -404,3 +404,12 @@ test('exchange timeouts cap at ten minutes', async t => {
   await run({ ...environment, 'INPUT_TIMEOUT-SECONDS': '200' }, context);
   assert.deepEqual(durations, [15000, 200000, 2000, 15000, 400000, 2000, 15000, 600000]);
 });
+
+
+test('HTTP failures always emit diagnostics even without headers or a body', async () => {
+  const context = harness([new Response(null, { status: 500 })]);
+  await assert.rejects(run({ ...environment, 'INPUT_MAX-RETRIES': '0' }, context), /HTTP 500/);
+  const log = context.logs.find(line => line.includes('response diagnostics'));
+  assert.match(log, /"httpStatus":500/);
+  assert.match(log, /"bodyStatus":"empty"/);
+});

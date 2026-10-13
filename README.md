@@ -77,3 +77,10 @@ immediately. Logs include allowlisted transport error codes and whether response
 headers arrived, without raw exception messages. Diagnostic response reads are
 limited to two seconds. Custom CA settings use Node's certificate configuration;
 this transport does not automatically configure proxies from environment variables.
+
+With `log-responses` enabled, every HTTP failure emits a diagnostic summary with
+`httpStatus` and `bodyStatus`, even when no diagnostic headers or message exist.
+JSON error messages (including problem-detail fields) and plain-text errors are
+sanitized and limited to 512 characters after reading at most 8192 bytes. Empty,
+unsupported (including HTML), oversized, malformed JSON, unreadable, and timed-out
+bodies are identified explicitly. Successful response bodies are never logged.

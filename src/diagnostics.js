@@ -6,6 +6,7 @@ function sanitize(value, secrets) {
     if (secret) text = text.split(secret).join('[redacted]');
   }
   return text
+    .replace(/\b(?:api[-_ ]?key|access[-_ ]?token|id[-_ ]?token|token|authorization|password|secret)\b["']?\s*[:=]\s*(["'])(.*?)\1/gis, '[redacted credential]')
     .replace(/\bBearer\s+\S+/gi, 'Bearer [redacted]')
     .replace(/\b(?:api[-_ ]?key|access[-_ ]?token|id[-_ ]?token|token|authorization|password|secret)\b["']?\s*[:=]\s*["']?[^\s,"'}]+/gi, '[redacted credential]')
     .replace(/\b[A-Za-z0-9_+/=-]{32,}(?:\.[A-Za-z0-9_+/=-]+)*/g, '[redacted]')
@@ -19,31 +20,40 @@ function responseHeaders(response, secrets) {
   const details = {};
   for (const name of ['content-type', 'retry-after', 'x-request-id', 'x-correlation-id', 'request-id', 'x-ms-request-id', 'x-github-request-id']) {
     const value = response.headers?.get(name);
-    if (value) details[name] = sanitize(value, secrets);
+    if (typeof value === 'string') details[name] = sanitize(value, secrets);
   }
   return details;
 }
 
 async function errorMessage(response, secrets) {
   const contentType = response.headers?.get('content-type')?.split(';')[0].trim().toLowerCase();
-  if (contentType !== 'application/json' && !contentType?.endsWith('+json')) {
-    await response.body?.cancel();
-    return undefined;
+  const json = contentType === 'application/json' || contentType?.endsWith('+json');
+  if (contentType && !json && contentType !== 'text/plain') {
+    response.body?.cancel?.().catch(() => {});
+    return { bodyStatus: 'unsupported_content_type' };
   }
-  const reader = response.body?.getReader();
-  if (!reader) return undefined;
-  const chunks = [];
-  let length = 0;
+  const reader = response.body?.getReader?.();
+  if (!reader && !response.text) return { bodyStatus: 'unavailable' };
   try {
-    while (true) {
+    const chunks = [];
+    let length = 0;
+    while (reader) {
       const { done, value } = await reader.read();
       if (done) break;
       length += value.byteLength;
-      if (length > 8192) return undefined;
+      if (length > 8192) return { bodyStatus: 'too_large' };
       chunks.push(Buffer.from(value));
     }
-    const data = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-    // Redact credential fields even when their values are echoed in the message.
+    const text = reader ? Buffer.concat(chunks).toString('utf8') : await response.text(8192);
+    if (Buffer.byteLength(text) > 8192) return { bodyStatus: 'too_large' };
+    if (!text.trim()) return { bodyStatus: 'empty' };
+    // Without a content type, do not treat HTML or binary data as plain text.
+    if (!json && !contentType && /^\s*</.test(text)) return { bodyStatus: 'unsupported_content_type' };
+    if (!json && /[\x00-\x08\x0e-\x1f]/.test(text)) return { bodyStatus: 'unsupported_content_type' };
+    if (!json) return { bodyStatus: 'text', message: sanitize(text, secrets) };
+    let data;
+    try { data = JSON.parse(text); }
+    catch { return { bodyStatus: 'invalid_json' }; }
     const sensitive = [...secrets];
     function collect(value) {
       if (!value || typeof value !== 'object') return;
@@ -53,12 +63,33 @@ async function errorMessage(response, secrets) {
       }
     }
     collect(data);
-    const message = typeof data?.error === 'string' ? data.error : data?.error?.message ?? data?.message;
-    return typeof message === 'string' ? sanitize(message, sensitive) : undefined;
+    const message = typeof data?.error === 'string' ? data.error : data?.error?.message ?? data?.message ?? data?.detail ?? data?.title;
+    return typeof message === 'string'
+      ? { bodyStatus: 'json', message: sanitize(message, sensitive) }
+      : { bodyStatus: 'no_error_message' };
+  } catch (error) {
+    return { bodyStatus: error?.code === 'ERR_INDEX_TOO_LARGE' ? 'too_large' : 'read_error' };
   } finally {
-    await reader.cancel().catch(() => {});
-    reader.releaseLock();
+    // Cleanup must not hold the HTTP outcome hostage to a stalled stream.
+    if (reader) reader.cancel().catch(() => {}).finally(() => reader.releaseLock()).catch(() => {});
+    else response.body?.cancel?.().catch(() => {});
   }
 }
 
-module.exports = { responseHeaders, errorMessage };
+async function readErrorMessage(response, secrets, signal) {
+  let abort;
+  try {
+    return await Promise.race([
+      new Promise(resolve => {
+        abort = () => resolve({ bodyStatus: 'timeout' });
+        if (signal.aborted) abort();
+        else signal.addEventListener('abort', abort, { once: true });
+      }),
+      errorMessage(response, secrets)
+    ]);
+  } finally {
+    signal.removeEventListener('abort', abort);
+  }
+}
+
+module.exports = { responseHeaders, errorMessage, readErrorMessage };
