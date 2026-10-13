@@ -14,12 +14,15 @@ inputs:
   audience:
     description: OIDC audience, matching NuGet/login.
     default: 'https://www.nuget.org'
+  log-responses:
+    description: Log sanitized error messages and selected diagnostic response headers. Successful response bodies are never logged.
+    default: 'false'
   max-retries:
     description: Retries per request for transient network failures, throttling, and server errors (0-5).
-    default: '3'
+    default: '2'
   timeout-seconds:
-    description: Timeout for each HTTP attempt including its response body (1-600 seconds). Defaults to 240 seconds.
-    default: '240'
+    description: Timeout for each HTTP attempt including its response body (1-600 seconds). Defaults to 60 seconds. The entire login is limited to 240 seconds, including requests and retry waits.
+    default: '60'
 outputs:
   NUGET_API_KEY:
     description: Masked, short-lived NuGet.org API key for use in subsequent steps of the same job.

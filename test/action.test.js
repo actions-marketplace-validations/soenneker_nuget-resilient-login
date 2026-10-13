@@ -16,6 +16,7 @@ function harness(responses) {
   const calls = [], events = [], waits = [], logs = [];
   return {
     calls, events, waits, logs,
+    now: () => 0,
     random: () => 0,
     info: message => logs.push(message),
     fetch: async (url, options) => {
@@ -49,8 +50,8 @@ test('exchanges OIDC with the required audience and masks all credentials before
 test('retries throttling and network failures with bounded delays', async () => {
   const context = harness([json({}, 429, { 'retry-after': '120' }), new Error('private network details'), json({ value: 'oidc' }), json({ apiKey: 'key' })]);
   await run(environment, context);
-  assert.deepEqual(context.waits, [120000, 2000]);
-  assert.equal(context.logs.length, 2);
+  assert.deepEqual(context.waits, [120000, 30000]);
+  assert.equal(context.logs.filter(message => message.includes(': retry')).length, 2);
   assert.ok(context.logs.every(message => !message.includes('secret') && !message.includes('private network details')));
   assert.equal(retryDelay('0', 0), 0);
 });
@@ -60,7 +61,7 @@ test('obtains a fresh OIDC token for each token-exchange retry', async () => {
   await run(environment, context);
   assert.equal(context.calls.length, 4);
   assert.equal(context.calls[3].options.headers.Authorization, 'Bearer fresh-oidc');
-  assert.deepEqual(context.waits, [1000]);
+  assert.deepEqual(context.waits, [10000]);
 });
 
 test('fails without retrying or exposing the response on a rejected policy', async () => {
@@ -90,17 +91,17 @@ test('validates permissions, numeric settings, and HTTPS before making requests'
   }
 });
 
-test('defaults to 240 seconds with only user supplied and allows timeout overrides', async t => {
+test('defaults to 60 seconds with only user supplied and allows timeout overrides', async t => {
   const durations = [];
   t.mock.method(AbortSignal, 'timeout', milliseconds => {
     durations.push(milliseconds);
     return new AbortController().signal;
   });
   await run(environment, harness([json({ value: 'oidc' }), json({ apiKey: 'key' })]));
-  assert.deepEqual(durations, [240000, 240000]);
+  assert.deepEqual(durations, [240000, 60000, 60000]);
   durations.length = 0;
   await run({ ...environment, 'INPUT_TIMEOUT-SECONDS': '300' }, harness([json({ value: 'oidc' }), json({ apiKey: 'key' })]));
-  assert.deepEqual(durations, [300000, 300000]);
+  assert.deepEqual(durations, [240000, 240000, 240000]);
 });
 
 test('supports the upstream audience and token-service-url inputs', async () => {
@@ -127,10 +128,10 @@ test('honors Retry-After dates, rejects excessive delays, and adds bounded jitte
   const now = Date.parse('Mon, 12 Oct 2026 12:00:00 GMT');
   assert.equal(retryDelay('Mon, 12 Oct 2026 12:02:00 GMT', 0, () => 0, now), 120000);
   assert.equal(retryDelay('Mon, 12 Oct 2026 11:59:00 GMT', 0, () => 0, now), 0);
-  assert.equal(retryDelay('invalid', 0, () => 0.5), 1125);
-  assert.equal(retryDelay('-1', 0, () => 0), 1000);
-  assert.equal(retryDelay(' ', 0, () => 0), 1000);
-  assert.equal(retryDelay(null, 5, () => 0.99), 30000);
+  assert.equal(retryDelay('invalid', 0, () => 0.5), 10125);
+  assert.equal(retryDelay('-1', 0, () => 0), 10000);
+  assert.equal(retryDelay(' ', 0, () => 0), 10000);
+  assert.equal(retryDelay(null, 5, () => 0.99), 120247);
   assert.throws(() => retryDelay('301', 0), /longer than 300/);
   assert.throws(() => retryDelay('9'.repeat(400), 0), /longer than 300/);
 });
@@ -164,7 +165,7 @@ test('refreshes identity after an interrupted successful exchange response', asy
   const context = harness([json({ value: 'old-identity' }), interrupted, json({ value: 'new-identity' }), json({ apiKey: 'key' })]);
   await run(environment, context);
   assert.equal(context.calls[3].options.headers.Authorization, 'Bearer new-identity');
-  assert.ok(context.logs[0].includes('network error or timeout'));
+  assert.ok(context.logs.some(message => message.includes('network error or timeout')));
   assert.ok(!context.logs[0].includes('secret-body'));
 });
 
@@ -184,7 +185,8 @@ test('fails before requesting credentials when GitHub output is unavailable', as
 test('the request deadline covers a stalled response body', async t => {
   const timers = [];
   t.after(() => timers.forEach(clearTimeout));
-  t.mock.method(AbortSignal, 'timeout', () => {
+  t.mock.method(AbortSignal, 'timeout', milliseconds => {
+    if (milliseconds === 240000) return new AbortController().signal;
     const controller = new AbortController();
     timers.push(setTimeout(() => controller.abort(), 10));
     return controller.signal;
@@ -201,27 +203,142 @@ test('the request deadline covers a stalled response body', async t => {
 });
 
 
-test('spreads HTTP 500 retries over a longer recovery period without increasing attempts', async () => {
+test('defaults to two retries with ten and thirty second pauses', async () => {
   const context = harness(Array.from({ length: 4 }, () => json({}, 500)));
   await assert.rejects(run(environment, context), /GitHub OIDC request failed \(HTTP 500\)/);
-  assert.deepEqual(context.waits, [30000, 60000, 120000]);
-  assert.equal(context.calls.length, 4);
+  assert.deepEqual(context.waits, [10000, 30000]);
+  assert.equal(context.calls.length, 3);
   assert.ok(context.events.every(event => event[0] !== 'output'));
 });
 
-test('recovers from an exchange HTTP 500 with a fresh identity after the longer delay', async () => {
+test('recovers from an exchange HTTP 500 with a fresh identity after the retry delay', async () => {
   const context = harness([json({ value: 'old' }), json({}, 500), json({ value: 'fresh' }), json({ apiKey: 'key' })]);
   await run(environment, context);
-  assert.deepEqual(context.waits, [30000]);
+  assert.deepEqual(context.waits, [10000]);
   assert.equal(context.calls[3].options.headers.Authorization, 'Bearer fresh');
 });
 
-test('honors Retry-After on HTTP 500 and keeps other transient HTTP delays unchanged', async () => {
+test('honors Retry-After on HTTP 500 and uses the same backoff for transient failures', async () => {
   for (const status of [408, 429, 502, 503, 504, 500]) {
     const context = harness([json({}, status, status === 500 ? { 'retry-after': '15' } : {}), json({ value: 'oidc' }), json({ apiKey: 'key' })]);
     await run(environment, context);
-    assert.deepEqual(context.waits, [status === 500 ? 15000 : 1000]);
+    assert.deepEqual(context.waits, [status === 500 ? 15000 : 10000]);
   }
-  assert.equal(retryDelay(null, 0, () => 0.5, 0, 500), 30125);
-  assert.equal(retryDelay(null, 5, () => 0.5, 0, 500), 120000);
+  assert.equal(retryDelay(null, 0, () => 0.5, 0, 500), 10125);
+  assert.equal(retryDelay(null, 5, () => 0.5, 0, 500), 120125);
+});
+
+
+test('the overall deadline includes OIDC time and caps the exchange request', async t => {
+  const durations = [];
+  t.mock.method(AbortSignal, 'timeout', milliseconds => {
+    durations.push(milliseconds);
+    return new AbortController().signal;
+  });
+  const context = harness([json({ value: 'oidc' }), json({ apiKey: 'key' })]);
+  let elapsed = 0;
+  context.now = () => elapsed;
+  const fetch = context.fetch;
+  context.fetch = async (...args) => {
+    const response = await fetch(...args);
+    elapsed += 230000;
+    return response;
+  };
+  await assert.rejects(run(environment, context), /overall deadline/);
+  assert.deepEqual(durations, [240000, 60000, 10000]);
+  assert.ok(context.events.every(event => event[0] !== 'output'));
+});
+
+test('does not sleep or retry when Retry-After exceeds the remaining budget', async () => {
+  const context = harness([json({}, 429, { 'retry-after': '240' })]);
+  await assert.rejects(run(environment, context), /cannot retry within/);
+  assert.deepEqual(context.waits, []);
+  assert.equal(context.calls.length, 1);
+});
+
+test('overall deadline interrupts retry waits and stalled requests', async t => {
+  for (const stalledWait of [false, true]) {
+    const controller = new AbortController();
+    const timeout = t.mock.method(AbortSignal, 'timeout', milliseconds =>
+      milliseconds === 240000 ? controller.signal : new AbortController().signal);
+    const context = harness([json({}, 503)]);
+    if (stalledWait) {
+      context.sleep = async () => {
+        controller.abort();
+        return new Promise(() => {});
+      };
+    } else {
+      context.fetch = async () => {
+        controller.abort();
+        return new Promise(() => {});
+      };
+    }
+    await assert.rejects(run(environment, context), /overall deadline/);
+    assert.ok(context.events.every(event => event[0] !== 'output'));
+    timeout.mock.restore();
+  }
+});
+
+
+test('logs selected failure diagnostics and sanitizes reflected credentials', async () => {
+  const context = harness([json({ value: 'identity-secret' }), json({
+    error: 'Failure request-secret identity-secret unknown-key token=hidden-value\n::error:: injected',
+    apiKey: 'unknown-key'
+  }, 500, {
+    'content-type': 'application/json', 'retry-after': '10', 'x-request-id': 'request-123',
+    authorization: 'Bearer header-secret', 'set-cookie': 'cookie-secret'
+  })]);
+  await assert.rejects(run({ ...environment, 'INPUT_MAX-RETRIES': '0', 'INPUT_LOG-RESPONSES': 'true' }, context), /HTTP 500/);
+  const logs = context.logs.join('\n');
+  assert.match(logs, /request-123/);
+  assert.match(logs, /retry-after/);
+  assert.match(logs, /Failure/);
+  for (const secret of ['request-secret', 'identity-secret', 'unknown-key', 'hidden-value', 'header-secret', 'cookie-secret', '::error::'])
+    assert.ok(!logs.includes(secret), secret);
+});
+
+test('does not log successful response bodies, HTML, malformed JSON, or oversized JSON', async () => {
+  const success = harness([json({ value: 'identity-secret' }), json({ apiKey: 'api-secret', message: 'success-private' })]);
+  await run({ ...environment, 'INPUT_LOG-RESPONSES': 'true' }, success);
+  assert.ok(!success.logs.join(' ').includes('success-private'));
+  for (const [body, type] of [
+    ['<html>private-body</html>', 'text/html'],
+    ['private-body', 'application/json'],
+    [JSON.stringify({ error: 'private-body' + 'x'.repeat(8192) }), 'application/json']
+  ]) {
+    const context = harness([new Response(body, { status: 403, headers: { 'content-type': type } })]);
+    await assert.rejects(run({ ...environment, 'INPUT_LOG-RESPONSES': 'true' }, context), /HTTP 403/);
+    assert.ok(!context.logs.join(' ').includes('private-body'));
+    assert.match(context.logs.join(' '), /content-type/);
+    assert.equal(context.calls.length, 1);
+  }
+});
+
+test('stalled diagnostic bodies preserve nonretryable HTTP status', async t => {
+  const timers = [];
+  t.after(() => timers.forEach(clearTimeout));
+  t.mock.method(AbortSignal, 'timeout', milliseconds => {
+    const controller = new AbortController();
+    if (milliseconds !== 240000) timers.push(setTimeout(() => controller.abort(), 10));
+    return controller.signal;
+  });
+  const context = harness([new Response(new ReadableStream({ pull: () => new Promise(() => {}) }), {
+    status: 403, headers: { 'content-type': 'application/json' }
+  })]);
+  await assert.rejects(run({ ...environment, 'INPUT_LOG-RESPONSES': 'true' }, context), /HTTP 403/);
+  assert.equal(context.calls.length, 1);
+  assert.deepEqual(context.waits, []);
+});
+
+
+test('response diagnostics are opt-in and invalid options fail before network access', async () => {
+  for (const value of [undefined, 'false']) {
+    const context = harness([{ ok: false, status: 403, headers: new Headers({ 'x-request-id': 'private-id' }),
+      body: { cancel: async () => {}, getReader: () => { assert.fail('Disabled diagnostics read the body'); } } }]);
+    await assert.rejects(run({ ...environment, 'INPUT_LOG-RESPONSES': value }, context), /HTTP 403/);
+    assert.ok(context.logs.every(log => !log.includes('response diagnostics') && !log.includes('private-id')));
+  }
+  const context = harness([]);
+  await assert.rejects(run({ ...environment, 'INPUT_LOG-RESPONSES': 'yes' }, context), /log-responses/);
+  assert.equal(context.calls.length, 0);
 });

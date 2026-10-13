@@ -2,6 +2,7 @@
 
 const { setTimeout: sleep } = require('node:timers/promises');
 const { input, mask, output } = require('./runtime');
+const { responseHeaders, errorMessage } = require('./diagnostics');
 
 function integer(value, fallback, minimum, maximum, name) {
   const result = value === '' ? fallback : Number(value);
@@ -10,7 +11,7 @@ function integer(value, fallback, minimum, maximum, name) {
   return result;
 }
 
-function retryDelay(header, attempt, random = Math.random, now = Date.now(), status) {
+function retryDelay(header, attempt, random = Math.random, now = Date.now()) {
   const value = header?.trim();
   let seconds = value && /^\d+$/.test(value) ? Number(value) : NaN;
   if (seconds === Infinity) throw new Error('The service requested a Retry-After delay longer than 300 seconds. Retry the workflow later.');
@@ -20,33 +21,64 @@ function retryDelay(header, attempt, random = Math.random, now = Date.now(), sta
     if (seconds > 300) throw new Error('The service requested a Retry-After delay longer than 300 seconds. Retry the workflow later.');
     return Math.max(0, seconds * 1000);
   }
-  const baseDelay = status === 500 ? 30000 : 1000;
-  const maximumDelay = status === 500 ? 120000 : 30000;
-  return Math.min(maximumDelay, baseDelay * 2 ** attempt + Math.floor(random() * 250));
+  return Math.min(120000, 10000 * 3 ** attempt) + Math.floor(random() * 250);
+}
+
+function checkDeadline(settings) {
+  if (settings.signal.aborted || settings.now() >= settings.deadline)
+    throw new Error('NuGet login exceeded its four-minute overall deadline. Retry the workflow later.');
+}
+
+function abortable(operation, signal) {
+  return new Promise((resolve, reject) => {
+    const abort = () => reject(signal.reason);
+    if (signal.aborted) return abort();
+    signal.addEventListener('abort', abort, { once: true });
+    Promise.resolve().then(operation).then(resolve, reject).finally(() => signal.removeEventListener('abort', abort));
+  });
 }
 
 async function requestJson(url, options, label, settings, fetchImpl, wait) {
   for (let attempt = 0; attempt <= settings.retries; attempt++) {
+    checkDeadline(settings);
     // Token exchange retries must acquire a fresh, single-use OIDC token.
     const requestOptions = typeof options === 'function' ? await options() : options;
+    checkDeadline(settings);
+    const started = settings.now();
+    const signal = AbortSignal.any([settings.signal, AbortSignal.timeout(Math.min(settings.timeout * 1000, Math.max(1, Math.ceil(settings.deadline - started))))]);
     let response;
     let body;
+    let diagnosticMessage;
     let transient = false;
     try {
-      response = await fetchImpl(url, {
-        ...requestOptions,
-        redirect: 'manual',
-        signal: AbortSignal.timeout(settings.timeout * 1000)
-      });
-      if (response.ok) body = await response.text();
-      // Cleanup must not turn a definitive HTTP rejection into a retryable error.
-      else {
-        try { await response.body?.cancel(); } catch { /* The HTTP status remains authoritative. */ }
-      }
+      await abortable(async () => {
+        response = await fetchImpl(url, {
+          ...requestOptions,
+          redirect: 'manual',
+          signal
+        });
+        if (response.ok) body = await response.text();
+        // Cleanup must not turn a definitive HTTP rejection into a retryable error.
+        else {
+          try {
+            if (settings.logResponses) diagnosticMessage = await errorMessage(response, settings.secrets);
+            else await response.body?.cancel();
+          } catch { /* Diagnostics must not change the HTTP outcome. */ }
+        }
+      }, signal);
     } catch {
-      // Never include fetch errors, headers, URLs, or response bodies in logs.
-      transient = true;
+      // Preserve a definitive HTTP rejection even if diagnostic reading times out.
+      // Never log raw transport errors.
+      transient = !response || response.ok;
     }
+
+    settings.info(`${label}: attempt ${attempt + 1}/${settings.retries + 1} completed in ${Math.round(settings.now() - started)}ms (${transient ? 'network error or timeout' : `HTTP ${response.status}`}).`);
+    if (settings.logResponses && response && !response.ok) {
+      const details = responseHeaders(response, settings.secrets);
+      if (diagnosticMessage) details.message = diagnosticMessage;
+      if (Object.keys(details).length) settings.info(`${label}: response diagnostics ${JSON.stringify(details)}`);
+    }
+    checkDeadline(settings);
 
     if (!transient && response.ok) {
       try { return JSON.parse(body); }
@@ -61,9 +93,12 @@ async function requestJson(url, options, label, settings, fetchImpl, wait) {
         : ' Check service availability and runner network access.';
       throw new Error(`${label} failed (${status}).${hint}`);
     }
-    const delay = retryDelay(response?.headers.get('retry-after') ?? null, attempt, settings.random, Date.now(), response?.status);
+    const delay = retryDelay(response?.headers.get('retry-after') ?? null, attempt, settings.random, Date.now());
+    if (delay >= settings.deadline - settings.now())
+      throw new Error('NuGet login cannot retry within its four-minute overall deadline. Retry the workflow later.');
     settings.info(`${label}: retry ${attempt + 1}/${settings.retries} in ${delay}ms (${response && !response.ok ? `HTTP ${response.status}` : 'network error or timeout'}).`);
-    await wait(delay);
+    try { await abortable(() => wait(delay, undefined, { signal: settings.signal }), settings.signal); }
+    catch (error) { checkDeadline(settings); throw error; }
   }
 }
 
@@ -76,9 +111,17 @@ async function run(env = process.env, dependencies = {}) {
     throw new Error('GITHUB_OUTPUT is unavailable. Run this action in a GitHub Actions step.');
   const user = input('user', env);
   if (!user) throw new Error('The user input must be the NuGet.org username of the trusted publishing policy creator.');
+  const logResponses = input('log-responses', env) || 'false';
+  if (!['true', 'false'].includes(logResponses)) throw new Error('log-responses must be true or false.');
+  const now = dependencies.now || (() => performance.now());
   const settings = {
-    retries: integer(input('max-retries', env), 3, 0, 5, 'max-retries'),
-    timeout: integer(input('timeout-seconds', env), 240, 1, 600, 'timeout-seconds'),
+    now,
+    secrets: [],
+    logResponses: logResponses === 'true',
+    deadline: now() + 240000,
+    signal: AbortSignal.timeout(240000),
+    retries: integer(input('max-retries', env), 2, 0, 5, 'max-retries'),
+    timeout: integer(input('timeout-seconds', env), 60, 1, 600, 'timeout-seconds'),
     random: dependencies.random || Math.random,
     info: dependencies.info || (message => process.stdout.write(`${message}\n`))
   };
@@ -93,6 +136,7 @@ async function run(env = process.env, dependencies = {}) {
   const requestToken = env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
   if (!requestToken || !env.ACTIONS_ID_TOKEN_REQUEST_URL)
     throw new Error('GitHub OIDC is unavailable. Add permissions: id-token: write to this job.');
+  settings.secrets.push(requestToken);
   setSecret(requestToken);
 
   let requestUrl;
@@ -108,6 +152,7 @@ async function run(env = process.env, dependencies = {}) {
     }, 'GitHub OIDC request', settings, fetchImpl, wait);
     if (typeof identity?.value !== 'string' || !identity.value.trim())
       throw new Error('GitHub OIDC response did not contain a token.');
+    settings.secrets.push(identity.value);
     setSecret(identity.value);
 
     return {
