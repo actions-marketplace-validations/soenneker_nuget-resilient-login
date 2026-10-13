@@ -98,10 +98,10 @@ test('defaults to 60 seconds with only user supplied and allows timeout override
     return new AbortController().signal;
   });
   await run(environment, harness([json({ value: 'oidc' }), json({ apiKey: 'key' })]));
-  assert.deepEqual(durations, [240000, 60000, 60000]);
+  assert.deepEqual(durations, [15000, 60000]);
   durations.length = 0;
   await run({ ...environment, 'INPUT_TIMEOUT-SECONDS': '300' }, harness([json({ value: 'oidc' }), json({ apiKey: 'key' })]));
-  assert.deepEqual(durations, [240000, 240000, 240000]);
+  assert.deepEqual(durations, [15000, 300000]);
 });
 
 test('supports the upstream audience and token-service-url inputs', async () => {
@@ -128,10 +128,10 @@ test('honors Retry-After dates, rejects excessive delays, and adds bounded jitte
   const now = Date.parse('Mon, 12 Oct 2026 12:00:00 GMT');
   assert.equal(retryDelay('Mon, 12 Oct 2026 12:02:00 GMT', 0, () => 0, now), 120000);
   assert.equal(retryDelay('Mon, 12 Oct 2026 11:59:00 GMT', 0, () => 0, now), 0);
-  assert.equal(retryDelay('invalid', 0, () => 0.5), 10125);
+  assert.equal(retryDelay('invalid', 0, () => 0.5), 12500);
   assert.equal(retryDelay('-1', 0, () => 0), 10000);
   assert.equal(retryDelay(' ', 0, () => 0), 10000);
-  assert.equal(retryDelay(null, 5, () => 0.99), 120247);
+  assert.equal(retryDelay(null, 5, () => 0.99), 179400);
   assert.throws(() => retryDelay('301', 0), /longer than 300/);
   assert.throws(() => retryDelay('9'.repeat(400), 0), /longer than 300/);
 });
@@ -224,61 +224,73 @@ test('honors Retry-After on HTTP 500 and uses the same backoff for transient fai
     await run(environment, context);
     assert.deepEqual(context.waits, [status === 500 ? 15000 : 10000]);
   }
-  assert.equal(retryDelay(null, 0, () => 0.5, 0, 500), 10125);
-  assert.equal(retryDelay(null, 5, () => 0.5, 0, 500), 120125);
+  assert.equal(retryDelay(null, 0, () => 0.5, 0, 500), 12500);
+  assert.equal(retryDelay(null, 5, () => 0.5, 0, 500), 150000);
 });
 
 
-test('the overall deadline includes OIDC time and caps the exchange request', async t => {
+test('exchange timeouts double on retries and recovery can exceed four minutes', async t => {
   const durations = [];
+  const controllers = [];
   t.mock.method(AbortSignal, 'timeout', milliseconds => {
     durations.push(milliseconds);
-    return new AbortController().signal;
+    const controller = new AbortController();
+    controllers.push(controller);
+    return controller.signal;
   });
-  const context = harness([json({ value: 'oidc' }), json({ apiKey: 'key' })]);
+  const context = harness([
+    json({ value: 'first' }), json({}),
+    json({ value: 'second' }), json({}),
+    json({ value: 'third' }), json({ apiKey: 'key' })
+  ]);
   let elapsed = 0;
   context.now = () => elapsed;
   const fetch = context.fetch;
   context.fetch = async (...args) => {
     const response = await fetch(...args);
-    elapsed += 230000;
+    if (context.calls.length === 2 || context.calls.length === 4) {
+      elapsed += durations.at(-1);
+      controllers.at(-1).abort();
+      return new Promise(() => {});
+    }
+    if (context.calls.length === 6) elapsed += 100000;
     return response;
   };
-  await assert.rejects(run(environment, context), /overall deadline/);
-  assert.deepEqual(durations, [240000, 60000, 10000]);
-  assert.ok(context.events.every(event => event[0] !== 'output'));
+  context.sleep = async delay => {
+    assert.ok(context.logs.at(-1).includes('waiting ' + delay + 'ms...'));
+    context.waits.push(delay);
+    elapsed += delay;
+  };
+  await run(environment, context);
+  assert.deepEqual(durations, [15000, 60000, 15000, 120000, 15000, 240000]);
+  assert.ok(elapsed > 240000);
+  assert.deepEqual(context.waits, [10000, 30000]);
+  assert.equal(context.calls[5].options.headers.Authorization, 'Bearer third');
+  assert.ok(context.logs.some(log => log.includes('starting (timeout 240000ms)')));
+  assert.deepEqual(context.events.at(-1), ['output', 'NUGET_API_KEY', 'key']);
 });
 
-test('does not sleep or retry when Retry-After exceeds the remaining budget', async () => {
-  const context = harness([json({}, 429, { 'retry-after': '240' })]);
-  await assert.rejects(run(environment, context), /cannot retry within/);
-  assert.deepEqual(context.waits, []);
-  assert.equal(context.calls.length, 1);
+test('OIDC retry timeouts stay at fifteen seconds regardless of exchange configuration', async t => {
+  const durations = [];
+  t.mock.method(AbortSignal, 'timeout', milliseconds => {
+    durations.push(milliseconds);
+    return new AbortController().signal;
+  });
+  const context = harness(Array.from({ length: 6 }, () => json({}, 503)));
+  await assert.rejects(run({ ...environment, 'INPUT_TIMEOUT-SECONDS': '200', 'INPUT_MAX-RETRIES': '5' }, context), /HTTP 503/);
+  assert.deepEqual(durations, [15000, 2000, 15000, 2000, 15000, 2000]);
 });
 
-test('overall deadline interrupts retry waits and stalled requests', async t => {
-  for (const stalledWait of [false, true]) {
-    const controller = new AbortController();
-    const timeout = t.mock.method(AbortSignal, 'timeout', milliseconds =>
-      milliseconds === 240000 ? controller.signal : new AbortController().signal);
-    const context = harness([json({}, 503)]);
-    if (stalledWait) {
-      context.sleep = async () => {
-        controller.abort();
-        return new Promise(() => {});
-      };
-    } else {
-      context.fetch = async () => {
-        controller.abort();
-        return new Promise(() => {});
-      };
-    }
-    await assert.rejects(run(environment, context), /overall deadline/);
-    assert.ok(context.events.every(event => event[0] !== 'output'));
-    timeout.mock.restore();
-  }
+test('honors Retry-After even when the wait exceeds four minutes', async () => {
+  const context = harness([json({}, 429, { 'retry-after': '300' }), json({ value: 'oidc' }), json({ apiKey: 'key' })]);
+  let elapsed = 0;
+  context.now = () => elapsed;
+  context.sleep = async delay => { context.waits.push(delay); elapsed += delay; };
+  await run(environment, context);
+  assert.deepEqual(context.waits, [300000]);
+  assert.equal(context.calls.length, 3);
+  assert.deepEqual(context.events.at(-1), ['output', 'NUGET_API_KEY', 'key']);
 });
-
 
 test('logs selected failure diagnostics and sanitizes reflected credentials', async () => {
   const context = harness([json({ value: 'identity-secret' }), json({
@@ -319,7 +331,7 @@ test('stalled diagnostic bodies preserve nonretryable HTTP status', async t => {
   t.after(() => timers.forEach(clearTimeout));
   t.mock.method(AbortSignal, 'timeout', milliseconds => {
     const controller = new AbortController();
-    if (milliseconds !== 240000) timers.push(setTimeout(() => controller.abort(), 10));
+    timers.push(setTimeout(() => controller.abort(), 10));
     return controller.signal;
   });
   const context = harness([new Response(new ReadableStream({ pull: () => new Promise(() => {}) }), {
@@ -344,4 +356,51 @@ test('response diagnostics default on, can be disabled, and reject invalid optio
   const context = harness([]);
   await assert.rejects(run({ ...environment, 'INPUT_LOG-RESPONSES': 'yes' }, context), /log-responses/);
   assert.equal(context.calls.length, 0);
+});
+
+
+test('permanent nested transport errors fail immediately without leaking arbitrary details', async () => {
+  for (const code of ['CERT_HAS_EXPIRED', 'ERR_TLS_CERT_ALTNAME_INVALID', 'ERR_INVALID_CHAR']) {
+    const error = new TypeError('request-secret', { cause: Object.assign(new Error('identity-secret'), { code }) });
+    const context = harness([error]);
+    await assert.rejects(run(environment, context), new RegExp(code));
+    assert.deepEqual(context.waits, []);
+    assert.equal(context.calls.length, 1);
+    assert.ok(!context.logs.join(' ').includes('request-secret'));
+    assert.match(context.logs.join(' '), /response headers not received/);
+  }
+});
+
+test('temporary nested transport errors retry and identify the code', async () => {
+  const error = new TypeError('private', { cause: Object.assign(new Error('private'), { code: 'ECONNRESET' }) });
+  const context = harness([error, json({ value: 'oidc' }), json({ apiKey: 'key' })]);
+  await run(environment, context);
+  assert.deepEqual(context.waits, [10000]);
+  assert.match(context.logs.join(' '), /ECONNRESET/);
+});
+
+test('stalled diagnostic reading stops at two seconds even with a long attempt', async t => {
+  const durations = [];
+  const timers = [];
+  t.after(() => timers.forEach(clearTimeout));
+  t.mock.method(AbortSignal, 'timeout', ms => {
+    durations.push(ms);
+    const controller = new AbortController();
+    if (ms === 2000) timers.push(setTimeout(() => controller.abort(), 5));
+    return controller.signal;
+  });
+  const context = harness([json({ value: 'oidc' }), new Response(new ReadableStream({ pull: () => new Promise(() => {}) }), {
+    status: 403, headers: { 'content-type': 'application/json' }
+  })]);
+  await assert.rejects(run({ ...environment, 'INPUT_TIMEOUT-SECONDS': '600' }, context), /HTTP 403/);
+  assert.deepEqual(durations, [15000, 600000, 2000]);
+  assert.deepEqual(context.waits, []);
+});
+
+test('exchange timeouts cap at ten minutes', async t => {
+  const durations = [];
+  t.mock.method(AbortSignal, 'timeout', ms => { durations.push(ms); return new AbortController().signal; });
+  const context = harness([json({ value: 'a' }), json({}, 503), json({ value: 'b' }), json({}, 503), json({ value: 'c' }), json({ apiKey: 'key' })]);
+  await run({ ...environment, 'INPUT_TIMEOUT-SECONDS': '200' }, context);
+  assert.deepEqual(durations, [15000, 200000, 2000, 15000, 400000, 2000, 15000, 600000]);
 });

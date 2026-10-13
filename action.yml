@@ -18,10 +18,10 @@ inputs:
     description: Log sanitized error messages and selected diagnostic response headers. Successful response bodies are never logged.
     default: 'true'
   max-retries:
-    description: Retries per request for transient network failures, throttling, and server errors (0-5).
+    description: NuGet retries for transient failures (0-5). GitHub OIDC uses at most two retries, or this value when lower.
     default: '2'
   timeout-seconds:
-    description: Timeout for each HTTP attempt including its response body (1-600 seconds). Defaults to 60 seconds. The entire login is limited to 240 seconds, including requests and retry waits.
+    description: Initial NuGet HTTP attempt timeout including its response body (1-600 seconds). Doubles on each retry up to 600 seconds per attempt. Defaults to 60 seconds. No overall login deadline.
     default: '60'
 outputs:
   NUGET_API_KEY:

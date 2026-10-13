@@ -1,6 +1,8 @@
 'use strict';
 
 const { setTimeout: sleep } = require('node:timers/promises');
+const { request } = require('./transport');
+const { failure } = require('./failure');
 const { input, mask, output } = require('./runtime');
 const { responseHeaders, errorMessage } = require('./diagnostics');
 
@@ -21,12 +23,8 @@ function retryDelay(header, attempt, random = Math.random, now = Date.now()) {
     if (seconds > 300) throw new Error('The service requested a Retry-After delay longer than 300 seconds. Retry the workflow later.');
     return Math.max(0, seconds * 1000);
   }
-  return Math.min(120000, 10000 * 3 ** attempt) + Math.floor(random() * 250);
-}
-
-function checkDeadline(settings) {
-  if (settings.signal.aborted || settings.now() >= settings.deadline)
-    throw new Error('NuGet login exceeded its four-minute overall deadline. Retry the workflow later.');
+  const base = Math.min(120000, 10000 * 3 ** attempt);
+  return base + Math.floor(random() * base * 0.5);
 }
 
 function abortable(operation, signal) {
@@ -40,16 +38,17 @@ function abortable(operation, signal) {
 
 async function requestJson(url, options, label, settings, fetchImpl, wait) {
   for (let attempt = 0; attempt <= settings.retries; attempt++) {
-    checkDeadline(settings);
     // Token exchange retries must acquire a fresh, single-use OIDC token.
     const requestOptions = typeof options === 'function' ? await options() : options;
-    checkDeadline(settings);
+    const timeout = Math.min(settings.timeout * (settings.fixedTimeout ? 1 : 2 ** attempt), 600) * 1000;
+    settings.info(`${label}: attempt ${attempt + 1}/${settings.retries + 1} starting (timeout ${timeout}ms).`);
     const started = settings.now();
-    const signal = AbortSignal.any([settings.signal, AbortSignal.timeout(Math.min(settings.timeout * 1000, Math.max(1, Math.ceil(settings.deadline - started))))]);
+    const controller = new AbortController();
+    const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(timeout)]);
     let response;
     let body;
     let diagnosticMessage;
-    let transient = false;
+    let transportFailure;
     try {
       await abortable(async () => {
         response = await fetchImpl(url, {
@@ -61,49 +60,52 @@ async function requestJson(url, options, label, settings, fetchImpl, wait) {
         // Cleanup must not turn a definitive HTTP rejection into a retryable error.
         else {
           try {
-            if (settings.logResponses) diagnosticMessage = await errorMessage(response, settings.secrets);
-            else await response.body?.cancel();
-          } catch { /* Diagnostics must not change the HTTP outcome. */ }
+            await abortable(async () => {
+              if (settings.logResponses) diagnosticMessage = await errorMessage(response, settings.secrets);
+              else await response.body?.cancel();
+            }, AbortSignal.timeout(2000));
+          } catch {
+            // Stop stalled diagnostic reads without changing the definitive HTTP status.
+            controller.abort();
+          }
         }
       }, signal);
-    } catch {
-      // Preserve a definitive HTTP rejection even if diagnostic reading times out.
-      // Never log raw transport errors.
-      transient = !response || response.ok;
+    } catch (error) {
+      if (!response || response.ok) transportFailure = failure(error, signal);
     }
+    const status = transportFailure
+      ? `network error or timeout: ${transportFailure.code}; response headers ${response ? 'received' : 'not received'}`
+      : `HTTP ${response.status}`;
 
-    settings.info(`${label}: attempt ${attempt + 1}/${settings.retries + 1} completed in ${Math.round(settings.now() - started)}ms (${transient ? 'network error or timeout' : `HTTP ${response.status}`}).`);
+    settings.info(`${label}: attempt ${attempt + 1}/${settings.retries + 1} completed in ${Math.round(settings.now() - started)}ms (${status}).`);
     if (settings.logResponses && response && !response.ok) {
       const details = responseHeaders(response, settings.secrets);
       if (diagnosticMessage) details.message = diagnosticMessage;
       if (Object.keys(details).length) settings.info(`${label}: response diagnostics ${JSON.stringify(details)}`);
     }
-    checkDeadline(settings);
 
-    if (!transient && response.ok) {
+    if (!transportFailure && response.ok) {
       try { return JSON.parse(body); }
       catch { throw new Error(`${label} returned invalid JSON.`); }
     }
 
-    transient ||= [408, 429, 500, 502, 503, 504].includes(response.status);
+    const transient = transportFailure ? transportFailure.retry : [408, 429, 500, 502, 503, 504].includes(response.status);
     if (!transient || attempt === settings.retries) {
-      const status = transient && (!response || response.ok) ? 'network error or timeout' : `HTTP ${response.status}`;
-      const hint = response && [400, 401, 403].includes(response.status)
+      const hint = transportFailure && !transportFailure.retry
+        ? ' Fix the runner certificate trust or request configuration; retrying will not help.'
+        : response && [400, 401, 403].includes(response.status)
         ? ' Check id-token: write, the NuGet policy creator username, repository, workflow filename, and environment in your trusted publishing policy.'
         : ' Check service availability and runner network access.';
       throw new Error(`${label} failed (${status}).${hint}`);
     }
     const delay = retryDelay(response?.headers.get('retry-after') ?? null, attempt, settings.random, Date.now());
-    if (delay >= settings.deadline - settings.now())
-      throw new Error('NuGet login cannot retry within its four-minute overall deadline. Retry the workflow later.');
-    settings.info(`${label}: retry ${attempt + 1}/${settings.retries} in ${delay}ms (${response && !response.ok ? `HTTP ${response.status}` : 'network error or timeout'}).`);
-    try { await abortable(() => wait(delay, undefined, { signal: settings.signal }), settings.signal); }
-    catch (error) { checkDeadline(settings); throw error; }
+    settings.info(`${label}: retry ${attempt + 1}/${settings.retries}: waiting ${delay}ms... (${status}).`);
+    await wait(delay);
   }
 }
 
 async function run(env = process.env, dependencies = {}) {
-  const fetchImpl = dependencies.fetch || fetch;
+  const fetchImpl = dependencies.fetch || request;
   const wait = dependencies.sleep || sleep;
   const setSecret = dependencies.mask || mask;
   const setOutput = dependencies.output || ((name, value) => output(name, value, env));
@@ -118,8 +120,6 @@ async function run(env = process.env, dependencies = {}) {
     now,
     secrets: [],
     logResponses: logResponses === 'true',
-    deadline: now() + 240000,
-    signal: AbortSignal.timeout(240000),
     retries: integer(input('max-retries', env), 2, 0, 5, 'max-retries'),
     timeout: integer(input('timeout-seconds', env), 60, 1, 600, 'timeout-seconds'),
     random: dependencies.random || Math.random,
@@ -149,7 +149,7 @@ async function run(env = process.env, dependencies = {}) {
   const token = await requestJson(tokenServiceUrl, async () => {
     const identity = await requestJson(requestUrl, {
       headers: { Authorization: `Bearer ${requestToken}`, Accept: 'application/json' }
-    }, 'GitHub OIDC request', settings, fetchImpl, wait);
+    }, 'GitHub OIDC request', { ...settings, retries: Math.min(settings.retries, 2), timeout: 15, fixedTimeout: true }, fetchImpl, wait);
     if (typeof identity?.value !== 'string' || !identity.value.trim())
       throw new Error('GitHub OIDC response did not contain a token.');
     settings.secrets.push(identity.value);

@@ -47,27 +47,33 @@ The action defaults to NuGet.org and does not restore or push packages.
 | `user` | Required | NuGet.org username of the policy creator |
 | `token-service-url` | `https://www.nuget.org/api/v2/token` | HTTPS exchange endpoint, as in `NuGet/login` |
 | `audience` | `https://www.nuget.org` | OIDC audience, as in `NuGet/login` |
-| `max-retries` | `3` | Retries per request, from 0 through 5 |
-| `timeout-seconds` | `240` | Per-attempt timeout, from 1 through 600 seconds |
+| `max-retries` | `2` | NuGet retries, from 0 through 5; OIDC uses at most two |
+| `timeout-seconds` | `60` | Initial NuGet attempt timeout, from 1 through 600 seconds; doubles on each retry up to 600 seconds |
+| `log-responses` | `true` | Log sanitized error messages and selected diagnostic response headers |
 
-The default timeout is 240 seconds (four minutes) for the whole HTTP attempt,
-including reading the body. `NuGet/login` uses a 180-second socket inactivity
-timeout. Set `timeout-seconds: '300'`
-if you want five minutes per attempt. Retries are additional attempts, not part
-of a single overall deadline. This setting does not change the issued key's
-lifetime: NuGet.org currently issues keys valid for one hour.
+The default attempt timeouts are 60, 120, and 240 seconds, including reading
+response bodies. Setting `timeout-seconds` changes the initial timeout; subsequent
+retries double it up to a ten-minute per-attempt cap. There is no overall login
+deadline in the action. GitHub Actions job and step timeouts still apply.
+Each fresh OIDC acquisition uses a fixed 15-second timeout and at most two
+retries (or fewer when max-retries is lower). This setting does not change the issued key's lifetime.
 
 Output: `NUGET_API_KEY`, compatible with workflows using `NuGet/login`.
 Network failures and HTTP 408, 429, 500, 502, 503, and 504 are retried with
-exponential backoff with jitter, capped at 30 seconds per delay. HTTP 500 uses
-longer backoff: 30, 60, then 120 seconds (plus jitter, capped at 120 seconds),
-giving the default three retries about three and a half minutes to recover. Valid Retry-After
-values are honored up to five minutes; longer requested delays stop the action
-so it never retries earlier than the server permits. Retry counts and delays
-are logged without credentials or response bodies. Other failures
-stop immediately. Response bodies and credentials are never included in errors.
+exponential backoff: 10, 30, 90, then 120 seconds, plus up to 50% jitter
+(default waits are 10–15 and 30–45 seconds). Valid Retry-After values are honored up to five minutes;
+longer requested delays stop the action so it never retries earlier than the
+server permits. Logs show each attempt's timeout and elapsed time, and
+`waiting Xms...` before each retry. Other failures stop immediately.
+Credentials and successful response bodies are never logged. Error response
+diagnostics are sanitized and can be disabled with `log-responses: 'false'`.
 Each token-exchange retry requests a fresh OIDC token because NuGet.org tokens
 are single-use. Set a custom endpoint only for a token service you trust: it
 receives the OIDC credential.
-Requests refuse redirects. Proxies and custom CA settings must be configured for
-Node's native fetch on self-hosted runners.
+Requests use native Node HTTPS with a ten-second connection timeout and no
+implicit header/body timeout; the attempt timeout covers the full response.
+Redirects are refused. Known certificate and request-configuration failures stop
+immediately. Logs include allowlisted transport error codes and whether response
+headers arrived, without raw exception messages. Diagnostic response reads are
+limited to two seconds. Custom CA settings use Node's certificate configuration;
+this transport does not automatically configure proxies from environment variables.
